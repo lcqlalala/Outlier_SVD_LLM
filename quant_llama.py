@@ -71,6 +71,10 @@ def llama_sequential(model, dataloader, dev):
                 ['mlp.up_u_proj', 'mlp.up_v_proj', 'mlp.gate_u_proj', 'mlp.gate_v_proj'],
                 ['mlp.down_u_proj', 'mlp.down_v_proj']
             ]
+            required = [name for group in sequential for name in group]
+            if not all(name in full for name in required):
+                print("Warning: true-sequential name pattern is not matched, fallback to quantizing all linear layers in current block.")
+                sequential = [list(full.keys())]
         else:
             sequential = [list(full.keys())]
        
@@ -312,4 +316,3 @@ if __name__ == '__main__':
                 'model': model,
                 'tokenizer': tokenizer
             }, args.save) 
-

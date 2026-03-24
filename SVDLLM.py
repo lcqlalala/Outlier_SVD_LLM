@@ -316,16 +316,21 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
 
     print("Start SAM: least-squares refit for up-projection...")
     sam_rel_updates = []
+    sam_total_modules = 0
     for i in tqdm(range(len(layers))):
         layer = layers[i]
-        subset = find_layers(layer)
         runtime = {}
         handles = []
 
-        for name in subset:
-            if i not in decomposition_book or name not in decomposition_book[i]:
+        if i not in decomposition_book:
+            continue
+
+        for name in decomposition_book[i]:
+            try:
+                parent_module, leaf_name = _get_parent_module(layer, name)
+                module = getattr(parent_module, leaf_name)
+            except Exception:
                 continue
-            module = subset[name]
             info = decomposition_book[i][name]
             if not isinstance(module, StableSVDLinear):
                 continue
@@ -341,7 +346,9 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
                 "right_proj": info["right_proj"].to(dev).float(),
                 "gram": torch.zeros((rank, rank), device=dev, dtype=torch.float32),
                 "rhs": torch.zeros((out_features, rank), device=dev, dtype=torch.float32),
+                "module": module,
             }
+            sam_total_modules += 1
 
         if len(runtime) == 0:
             continue
@@ -375,7 +382,7 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
             return _hook
 
         for name in runtime:
-            handles.append(subset[name].register_forward_hook(_make_hook(name)))
+            handles.append(runtime[name]["module"].register_forward_hook(_make_hook(name)))
 
         for batch in _iter_batches(calib_loader, sam_max_batches):
             batch = {k: v.to(dev) for k, v in batch.items()}
@@ -385,8 +392,8 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
             handle.remove()
 
         for name in runtime:
-            module = subset[name]
             info = runtime[name]
+            module = info["module"]
             gram = info["gram"]
             rhs = info["rhs"]
             rank = gram.shape[0]
@@ -414,11 +421,13 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
                 device=module.u_proj.weight.device,
             )
 
-            info["normal_idx"] = info["U"] = info["S"] = info["right_proj"] = None
+            info["normal_idx"] = info["U"] = info["S"] = info["right_proj"] = info["module"] = None
             info["gram"] = info["rhs"] = gram = rhs = gram_reg = solved = m_opt = old_w = None
-            del info["normal_idx"], info["U"], info["S"], info["right_proj"], info["gram"], info["rhs"], gram, rhs, gram_reg, solved, m_opt, old_w
+            del info["normal_idx"], info["U"], info["S"], info["right_proj"], info["module"], info["gram"], info["rhs"], gram, rhs, gram_reg, solved, m_opt, old_w
             torch.cuda.empty_cache()
 
+    if sam_total_modules == 0:
+        print("Warning: SAM did not find any StableSVDLinear modules to update.")
     if len(sam_rel_updates) > 0:
         rel_tensor = torch.tensor(sam_rel_updates, dtype=torch.float32)
         print(

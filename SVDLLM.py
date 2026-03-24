@@ -233,6 +233,23 @@ def _target_rank(rows, cols, ratio, max_rank):
     return min(rank, max_rank)
 
 
+def _energy_conserving_recalibrate(full_singular_values, selected_idx, max_scale=None, eps=1e-12):
+    selected_s = full_singular_values[selected_idx].float()
+    if selected_s.numel() == 0:
+        return selected_s, 1.0
+
+    total_energy = torch.sum(full_singular_values.float() * full_singular_values.float())
+    kept_energy = torch.sum(selected_s * selected_s)
+    if kept_energy <= eps or total_energy <= eps:
+        return selected_s, 1.0
+
+    gamma = torch.sqrt(total_energy / torch.clamp(kept_energy, min=eps))
+    if max_scale is not None and max_scale > 0:
+        gamma = torch.clamp(gamma, max=max_scale)
+    selected_s = selected_s * gamma
+    return selected_s, float(gamma.item())
+
+
 def _select_channel_partitions(scaling_diag_matrix, outlier_ratio, criterion="infinity_norm", channel_max_abs=None):
     in_features = scaling_diag_matrix.shape[0]
     all_indices = torch.arange(in_features, device=scaling_diag_matrix.device, dtype=torch.long)
@@ -278,182 +295,6 @@ def _iter_batches(calib_loader, max_batches=None):
     if isinstance(calib_loader, list):
         return calib_loader[:max_batches]
     return itertools.islice(calib_loader, max_batches)
-
-
-def _collect_batches(calib_loader, max_batches):
-    if max_batches is None:
-        if isinstance(calib_loader, list):
-            return calib_loader
-        return list(calib_loader)
-    if isinstance(calib_loader, list):
-        return calib_loader[:max_batches]
-    return list(itertools.islice(calib_loader, max_batches))
-
-
-def _complement_indices(total_size, selected_idx, device):
-    mask = torch.ones(total_size, dtype=torch.bool, device=device)
-    if selected_idx.numel() > 0:
-        mask[selected_idx] = False
-    return torch.arange(total_size, device=device, dtype=torch.long)[mask]
-
-
-def _apply_csra(
-    model_name,
-    model,
-    decomposition_book,
-    calib_loader,
-    dev,
-    csra_gamma=0.5,
-    csra_lambda_scale=1e-3,
-    csra_train_batches=32,
-    csra_val_batches=16,
-    csra_min_explain_ratio=0.05,
-):
-    if calib_loader is None:
-        print("Warning: CSRA enabled but calibration loader is None. Skip CSRA.")
-        return
-    if csra_train_batches <= 0 or csra_val_batches <= 0:
-        print("Warning: CSRA train/val batches should be > 0. Skip CSRA.")
-        return
-
-    total_needed = csra_train_batches + csra_val_batches
-    batches = _collect_batches(calib_loader, total_needed)
-    if len(batches) < total_needed:
-        print(f"Warning: CSRA needs {total_needed} batches but got {len(batches)}. Skip CSRA.")
-        return
-    train_batches = batches[:csra_train_batches]
-    val_batches = batches[csra_train_batches:csra_train_batches + csra_val_batches]
-
-    model = model.to(dev)
-    model.eval()
-    if "opt" in model_name:
-        layers = model.model.decoder.layers
-    else:
-        layers = model.model.layers
-
-    print("Start CSRA (Cross-Subspace Residual Absorption)...")
-    for i in tqdm(range(len(layers))):
-        layer = layers[i]
-        subset = find_layers(layer)
-        runtime = {}
-        handles = []
-
-        for name in subset:
-            info = decomposition_book[i][name]
-            if info["outlier_idx"].numel() == 0:
-                continue
-            if "selected_idx" not in info:
-                continue
-            selected_idx = info["selected_idx"]
-            total_rank = info["singular_values"].numel()
-            drop_idx = _complement_indices(total_rank, selected_idx, device=info["singular_values"].device)
-            if drop_idx.numel() == 0:
-                continue
-
-            U_drop = info["U"][:, drop_idx].float()
-            S_drop = info["singular_values"][drop_idx].float()
-            right_proj_drop = info["right_proj"][drop_idx, :].float()
-            w_unstable = (U_drop * S_drop.unsqueeze(0)).matmul(right_proj_drop).to(dev)
-
-            outlier_dim = info["outlier_idx"].numel()
-            runtime[name] = {
-                "normal_idx": info["normal_idx"].to(dev),
-                "outlier_idx": info["outlier_idx"].to(dev),
-                "w_unstable": w_unstable,
-                "A": torch.zeros((outlier_dim, outlier_dim), device=dev, dtype=torch.float32),
-                "B": torch.zeros((info["out_features"], outlier_dim), device=dev, dtype=torch.float32),
-                "delta": None,
-                "enabled": False,
-            }
-
-        if len(runtime) == 0:
-            continue
-
-        def _make_train_hook(name):
-            def _hook(_module, input, _output):
-                inp = input[0].detach().float()
-                if inp.dim() == 2:
-                    inp = inp.unsqueeze(0)
-                flat = inp.reshape(-1, inp.shape[-1])
-
-                rt = runtime[name]
-                x_normal = flat.index_select(1, rt["normal_idx"])
-                x_outlier = flat.index_select(1, rt["outlier_idx"])
-                e = x_normal.matmul(rt["w_unstable"].transpose(0, 1))
-                rt["A"] += x_outlier.transpose(0, 1).matmul(x_outlier)
-                rt["B"] += e.transpose(0, 1).matmul(x_outlier)
-            return _hook
-
-        for name in runtime:
-            handles.append(subset[name].register_forward_hook(_make_train_hook(name)))
-
-        for batch in train_batches:
-            batch = {k: v.to(dev) for k, v in batch.items()}
-            model(**batch)
-
-        for handle in handles:
-            handle.remove()
-
-        # Solve ridge regression Delta = B (A + lambda I)^(-1)
-        for name, rt in runtime.items():
-            outlier_dim = rt["A"].shape[0]
-            trace_A = torch.trace(rt["A"]).item()
-            lambda_eff = csra_lambda_scale * max(trace_A / max(outlier_dim, 1), 1e-12)
-            reg_eye = torch.eye(outlier_dim, device=dev, dtype=torch.float32) * lambda_eff
-            inv_term = torch.linalg.inv(rt["A"] + reg_eye)
-            rt["delta"] = rt["B"].matmul(inv_term)
-            rt["A"] = rt["B"] = inv_term = reg_eye = None
-
-        # Held-out explainability gating
-        handles = []
-        val_stats = {}
-        for name in runtime:
-            val_stats[name] = {"before": 0.0, "after": 0.0}
-
-        def _make_val_hook(name):
-            def _hook(_module, input, _output):
-                inp = input[0].detach().float()
-                if inp.dim() == 2:
-                    inp = inp.unsqueeze(0)
-                flat = inp.reshape(-1, inp.shape[-1])
-
-                rt = runtime[name]
-                x_normal = flat.index_select(1, rt["normal_idx"])
-                x_outlier = flat.index_select(1, rt["outlier_idx"])
-                e = x_normal.matmul(rt["w_unstable"].transpose(0, 1))
-                correction = x_outlier.matmul((csra_gamma * rt["delta"]).transpose(0, 1))
-                residual_after = e - correction
-
-                val_stats[name]["before"] += torch.sum(e * e).item()
-                val_stats[name]["after"] += torch.sum(residual_after * residual_after).item()
-            return _hook
-
-        for name in runtime:
-            handles.append(subset[name].register_forward_hook(_make_val_hook(name)))
-
-        for batch in val_batches:
-            batch = {k: v.to(dev) for k, v in batch.items()}
-            model(**batch)
-
-        for handle in handles:
-            handle.remove()
-
-        # Update outlier weight only for predictable/explainable residuals
-        for name, rt in runtime.items():
-            before = val_stats[name]["before"]
-            after = val_stats[name]["after"]
-            if before <= 0:
-                explain_ratio = 0.0
-            else:
-                explain_ratio = max(0.0, 1.0 - after / before)
-            if explain_ratio >= csra_min_explain_ratio:
-                info = decomposition_book[i][name]
-                info["outlier_weight"] = info["outlier_weight"] + (csra_gamma * rt["delta"]).cpu()
-                rt["enabled"] = True
-            rt["normal_idx"] = rt["outlier_idx"] = rt["w_unstable"] = rt["delta"] = None
-            torch.cuda.empty_cache()
-
-    model = model.cpu()
 
 
 @torch.no_grad()
@@ -560,12 +401,8 @@ def whitening(
     enable_stage3=False,
     stage3_lambda=1.0,
     stage3_max_batches=None,
-    enable_csra=False,
-    csra_gamma=0.5,
-    csra_lambda_scale=1e-3,
-    csra_train_batches=32,
-    csra_val_batches=16,
-    csra_min_explain_ratio=0.05,
+    enable_ecsvr=False,
+    ecsvr_max_scale=None,
 ):
     model.eval()
     if "opt" in model_name:
@@ -653,21 +490,8 @@ def whitening(
                 target_rank = decomposition_book[i][name]["target_rank"]
                 decomposition_book[i][name]["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
 
-    if enable_csra:
-        _apply_csra(
-            model_name=model_name,
-            model=model,
-            decomposition_book=decomposition_book,
-            calib_loader=calib_loader,
-            dev=dev,
-            csra_gamma=csra_gamma,
-            csra_lambda_scale=csra_lambda_scale,
-            csra_train_batches=csra_train_batches,
-            csra_val_batches=csra_val_batches,
-            csra_min_explain_ratio=csra_min_explain_ratio,
-        )
-
     print("Start reconstruction with selected stable directions...")
+    ecsvr_scales = []
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         subset = find_layers(layer)
@@ -680,7 +504,15 @@ def whitening(
                 selected_idx = torch.arange(min(1, info["singular_values"].numel()), dtype=torch.long)
 
             U_sel = info["U"][:, selected_idx].float()
-            S_sel = info["singular_values"][selected_idx].float()
+            if enable_ecsvr:
+                S_sel, gamma = _energy_conserving_recalibrate(
+                    info["singular_values"],
+                    selected_idx,
+                    max_scale=ecsvr_max_scale,
+                )
+                ecsvr_scales.append(gamma)
+            else:
+                S_sel = info["singular_values"][selected_idx].float()
             right_proj_sel = info["right_proj"][selected_idx, :].float()
 
             sqrt_s = torch.sqrt(torch.clamp(S_sel, min=0))
@@ -716,6 +548,14 @@ def whitening(
             U_sel = S_sel = right_proj_sel = sqrt_s = svd_u = svd_v = None
             del U_sel, S_sel, right_proj_sel, sqrt_s, svd_u, svd_v
             torch.cuda.empty_cache()
+    if enable_ecsvr and len(ecsvr_scales) > 0:
+        gamma_tensor = torch.tensor(ecsvr_scales, dtype=torch.float32)
+        print(
+            "EC-SVR scale stats: "
+            f"mean={gamma_tensor.mean().item():.4f}, "
+            f"min={gamma_tensor.min().item():.4f}, "
+            f"max={gamma_tensor.max().item():.4f}"
+        )
 
 
 @torch.no_grad()
@@ -956,12 +796,8 @@ if __name__ == '__main__':
     parser.add_argument('--enable_stage3', action='store_true', help='Stage 3: enable cross-sample stability selection')
     parser.add_argument('--stage3_lambda', type=float, default=1.0, help='Stage 3: variance penalty coefficient in stability score')
     parser.add_argument('--stage3_max_batches', type=int, default=None, help='Stage 3: optionally limit number of calibration batches for stability scoring')
-    parser.add_argument('--enable_csra', action='store_true', help='Enable CSRA residual absorption from dropped normal subspace to outlier subspace')
-    parser.add_argument('--csra_gamma', type=float, default=0.5, help='CSRA shrinkage/trust-region coefficient')
-    parser.add_argument('--csra_lambda_scale', type=float, default=1e-3, help='CSRA ridge scale: lambda = scale * trace(X_O X_O^T) / d_O')
-    parser.add_argument('--csra_train_batches', type=int, default=32, help='CSRA training batches (for solving Delta W_O)')
-    parser.add_argument('--csra_val_batches', type=int, default=16, help='CSRA held-out validation batches (for explainability gating)')
-    parser.add_argument('--csra_min_explain_ratio', type=float, default=0.05, help='CSRA gating threshold on held-out explained residual ratio')
+    parser.add_argument('--enable_ecsvr', action='store_true', help='Enable EC-SVR: energy-conserving singular value recalibration after truncation')
+    parser.add_argument('--ecsvr_max_scale', type=float, default=None, help='Optional cap for EC-SVR gamma to avoid over-amplification (e.g., 1.5)')
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -970,7 +806,7 @@ if __name__ == '__main__':
         model = model.eval()
         need_outlier_stats = args.stage1_outlier_ratio > 0 and args.stage1_outlier_criterion == "infinity_norm"
         cali_white_data = None
-        need_calibration_data = args.profiling_mat_path is None or args.enable_stage3 or args.enable_csra or need_outlier_stats
+        need_calibration_data = args.profiling_mat_path is None or args.enable_stage3 or need_outlier_stats
         if need_calibration_data:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
         outlier_channel_stats = None
@@ -1015,12 +851,8 @@ if __name__ == '__main__':
             enable_stage3=args.enable_stage3,
             stage3_lambda=args.stage3_lambda,
             stage3_max_batches=args.stage3_max_batches,
-            enable_csra=args.enable_csra,
-            csra_gamma=args.csra_gamma,
-            csra_lambda_scale=args.csra_lambda_scale,
-            csra_train_batches=args.csra_train_batches,
-            csra_val_batches=args.csra_val_batches,
-            csra_min_explain_ratio=args.csra_min_explain_ratio,
+            enable_ecsvr=args.enable_ecsvr,
+            ecsvr_max_scale=args.ecsvr_max_scale,
         )
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32

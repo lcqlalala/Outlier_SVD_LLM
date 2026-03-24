@@ -298,6 +298,139 @@ def _iter_batches(calib_loader, max_batches=None):
 
 
 @torch.no_grad()
+def _collect_output_moments(model_name, model, decomposition_book, calib_loader, dev, max_batches=None):
+    if calib_loader is None:
+        return None
+
+    model = model.to(dev)
+    model.eval()
+    if "opt" in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+
+    runtime = {}
+    handles = []
+    for i in range(len(layers)):
+        subset = find_layers(layers[i])
+        for name in subset:
+            if i not in decomposition_book or name not in decomposition_book[i]:
+                continue
+            out_features = int(decomposition_book[i][name]["out_features"])
+            runtime[(i, name)] = {
+                "sum": torch.zeros(out_features, device=dev, dtype=torch.float32),
+                "sum_sq": torch.zeros(out_features, device=dev, dtype=torch.float32),
+                "count": 0,
+            }
+
+            def _make_hook(layer_idx, module_name):
+                def _hook(_module, _input, output):
+                    out = output[0] if isinstance(output, (tuple, list)) else output
+                    out = out.detach().float()
+                    if out.dim() == 2:
+                        out = out.unsqueeze(0)
+                    out = out.reshape(-1, out.shape[-1])
+                    key = (layer_idx, module_name)
+                    runtime[key]["sum"] += out.sum(dim=0)
+                    runtime[key]["sum_sq"] += (out * out).sum(dim=0)
+                    runtime[key]["count"] += out.shape[0]
+                return _hook
+
+            handles.append(subset[name].register_forward_hook(_make_hook(i, name)))
+
+    for batch in _iter_batches(calib_loader, max_batches):
+        batch = {k: v.to(dev) for k, v in batch.items()}
+        model(**batch)
+
+    for handle in handles:
+        handle.remove()
+
+    output_moments = {}
+    for i in decomposition_book:
+        layer_moments = {}
+        for name in decomposition_book[i]:
+            key = (i, name)
+            if key not in runtime or runtime[key]["count"] <= 0:
+                out_features = int(decomposition_book[i][name]["out_features"])
+                mu = torch.zeros(out_features, dtype=torch.float32)
+                std = torch.ones(out_features, dtype=torch.float32)
+            else:
+                count = runtime[key]["count"]
+                mu = (runtime[key]["sum"] / count).cpu()
+                var = runtime[key]["sum_sq"] / count - (runtime[key]["sum"] / count) ** 2
+                var = torch.clamp(var, min=0).cpu()
+                std = torch.sqrt(var)
+            layer_moments[name] = {"mean": mu, "std": std}
+        output_moments[i] = layer_moments
+
+    model = model.cpu()
+    return output_moments
+
+
+@torch.no_grad()
+def _fuse_omoa_alignment(model_name, model, decomposition_book, orig_moments, comp_moments, dev, eps=1e-6, max_scale=None):
+    if orig_moments is None or comp_moments is None:
+        print("Warning: OMOA moments are unavailable, skipping alignment.")
+        return
+
+    if "opt" in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+
+    fused_scales = []
+    for i in range(len(layers)):
+        subset = find_layers(layers[i])
+        for name in subset:
+            if i not in decomposition_book or name not in decomposition_book[i]:
+                continue
+            module = subset[name]
+            if not isinstance(module, StableSVDLinear):
+                continue
+
+            mu_orig = orig_moments[i][name]["mean"].to(dev)
+            std_orig = orig_moments[i][name]["std"].to(dev)
+            mu_comp = comp_moments[i][name]["mean"].to(dev)
+            std_comp = comp_moments[i][name]["std"].to(dev)
+
+            scale = std_orig / (std_comp + eps)
+            if max_scale is not None and max_scale > 0:
+                min_scale = 1.0 / max_scale
+                scale = torch.clamp(scale, min=min_scale, max=max_scale)
+            bias_delta = mu_orig - scale * mu_comp
+
+            scale_w = scale.to(dtype=module.outlier_proj.weight.dtype if module.has_outlier else module.u_proj.weight.dtype)
+
+            if module.has_low_rank:
+                module.u_proj.weight.data = module.u_proj.weight.data * scale_w.unsqueeze(1).to(module.u_proj.weight.device)
+                if module.u_proj.bias is not None:
+                    bias_dtype = module.u_proj.bias.dtype
+                    bias_dev = module.u_proj.bias.device
+                    updated_bias = module.u_proj.bias.data.to(dtype=torch.float32, device=bias_dev) * scale.to(bias_dev) + bias_delta.to(bias_dev)
+                    module.u_proj.bias.data = updated_bias.to(dtype=bias_dtype)
+
+            if module.has_outlier:
+                module.outlier_proj.weight.data = module.outlier_proj.weight.data * scale_w.unsqueeze(1).to(module.outlier_proj.weight.device)
+
+            if (not module.has_low_rank) and getattr(module, "bias", None) is not None:
+                bias_dtype = module.bias.dtype
+                bias_dev = module.bias.device
+                updated_bias = module.bias.data.to(dtype=torch.float32, device=bias_dev) * scale.to(bias_dev) + bias_delta.to(bias_dev)
+                module.bias.data = updated_bias.to(dtype=bias_dtype)
+
+            fused_scales.append(scale.float().cpu())
+
+    if len(fused_scales) > 0:
+        scale_cat = torch.cat(fused_scales, dim=0)
+        print(
+            "OMOA scale stats: "
+            f"mean={scale_cat.mean().item():.4f}, "
+            f"min={scale_cat.min().item():.4f}, "
+            f"max={scale_cat.max().item():.4f}"
+        )
+
+
+@torch.no_grad()
 def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, stability_lambda, dev, stage3_max_batches=None):
     if calib_loader is None:
         print("Warning: Stage 3 is enabled, but no calibration loader is provided. Falling back to Stage 2 truncation.")
@@ -403,6 +536,10 @@ def whitening(
     stage3_max_batches=None,
     enable_ecsvr=False,
     ecsvr_max_scale=None,
+    enable_omoa=False,
+    omoa_max_batches=None,
+    omoa_eps=1e-6,
+    omoa_max_scale=None,
 ):
     model.eval()
     if "opt" in model_name:
@@ -490,6 +627,21 @@ def whitening(
                 target_rank = decomposition_book[i][name]["target_rank"]
                 decomposition_book[i][name]["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
 
+    orig_output_moments = None
+    if enable_omoa:
+        if calib_loader is None:
+            print("Warning: OMOA is enabled, but no calibration loader is provided. Skipping OMOA.")
+        else:
+            print("Start OMOA: collect original output moments...")
+            orig_output_moments = _collect_output_moments(
+                model_name=model_name,
+                model=model,
+                decomposition_book=decomposition_book,
+                calib_loader=calib_loader,
+                dev=dev,
+                max_batches=omoa_max_batches,
+            )
+
     print("Start reconstruction with selected stable directions...")
     ecsvr_scales = []
     for i in tqdm(range(len(layers))):
@@ -525,7 +677,7 @@ def whitening(
                 rank=svd_v.shape[0],
                 normal_indices=info["normal_idx"],
                 outlier_indices=info["outlier_idx"],
-                bias=info["has_bias"],
+                bias=info["has_bias"] or enable_omoa,
             ).to(dtype=module.weight.dtype, device=module.weight.device)
 
             if new_linear.has_low_rank:
@@ -548,6 +700,28 @@ def whitening(
             U_sel = S_sel = right_proj_sel = sqrt_s = svd_u = svd_v = None
             del U_sel, S_sel, right_proj_sel, sqrt_s, svd_u, svd_v
             torch.cuda.empty_cache()
+
+    if enable_omoa and orig_output_moments is not None:
+        print("Start OMOA: collect compressed output moments...")
+        comp_output_moments = _collect_output_moments(
+            model_name=model_name,
+            model=model,
+            decomposition_book=decomposition_book,
+            calib_loader=calib_loader,
+            dev=dev,
+            max_batches=omoa_max_batches,
+        )
+        print("Start OMOA: fuse scale and bias into compressed layers...")
+        _fuse_omoa_alignment(
+            model_name=model_name,
+            model=model,
+            decomposition_book=decomposition_book,
+            orig_moments=orig_output_moments,
+            comp_moments=comp_output_moments,
+            dev=dev,
+            eps=omoa_eps,
+            max_scale=omoa_max_scale,
+        )
     if enable_ecsvr and len(ecsvr_scales) > 0:
         gamma_tensor = torch.tensor(ecsvr_scales, dtype=torch.float32)
         print(
@@ -798,6 +972,10 @@ if __name__ == '__main__':
     parser.add_argument('--stage3_max_batches', type=int, default=None, help='Stage 3: optionally limit number of calibration batches for stability scoring')
     parser.add_argument('--enable_ecsvr', action='store_true', help='Enable EC-SVR: energy-conserving singular value recalibration after truncation')
     parser.add_argument('--ecsvr_max_scale', type=float, default=None, help='Optional cap for EC-SVR gamma to avoid over-amplification (e.g., 1.5)')
+    parser.add_argument('--enable_omoa', action='store_true', help='Enable OMOA: channel-wise output manifold scale/shift alignment')
+    parser.add_argument('--omoa_max_batches', type=int, default=None, help='OMOA: limit calibration batches for output moment alignment')
+    parser.add_argument('--omoa_eps', type=float, default=1e-6, help='OMOA: epsilon for stable scale computation')
+    parser.add_argument('--omoa_max_scale', type=float, default=2.0, help='OMOA: symmetric clamp for scale, in [1/max_scale, max_scale]')
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -806,7 +984,7 @@ if __name__ == '__main__':
         model = model.eval()
         need_outlier_stats = args.stage1_outlier_ratio > 0 and args.stage1_outlier_criterion == "infinity_norm"
         cali_white_data = None
-        need_calibration_data = args.profiling_mat_path is None or args.enable_stage3 or need_outlier_stats
+        need_calibration_data = args.profiling_mat_path is None or args.enable_stage3 or args.enable_omoa or need_outlier_stats
         if need_calibration_data:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
         outlier_channel_stats = None
@@ -853,6 +1031,10 @@ if __name__ == '__main__':
             stage3_max_batches=args.stage3_max_batches,
             enable_ecsvr=args.enable_ecsvr,
             ecsvr_max_scale=args.ecsvr_max_scale,
+            enable_omoa=args.enable_omoa,
+            omoa_max_batches=args.omoa_max_batches,
+            omoa_eps=args.omoa_eps,
+            omoa_max_scale=args.omoa_max_scale,
         )
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32

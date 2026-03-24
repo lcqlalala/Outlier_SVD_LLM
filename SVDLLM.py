@@ -315,6 +315,7 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
         layers = model.model.layers
 
     print("Start SAM: least-squares refit for up-projection...")
+    sam_rel_updates = []
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         subset = find_layers(layer)
@@ -404,6 +405,9 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
             except Exception:
                 solved = torch.matmul(torch.linalg.pinv(gram_reg), rhs.transpose(0, 1))
             m_opt = solved.transpose(0, 1)
+            old_w = module.u_proj.weight.data.detach().float()
+            rel_update = torch.norm(m_opt - old_w) / (torch.norm(old_w) + 1e-12)
+            sam_rel_updates.append(rel_update.item())
 
             module.u_proj.weight.data = m_opt.to(
                 dtype=module.u_proj.weight.dtype,
@@ -411,9 +415,18 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
             )
 
             info["normal_idx"] = info["U"] = info["S"] = info["right_proj"] = None
-            info["gram"] = info["rhs"] = gram = rhs = gram_reg = solved = m_opt = None
-            del info["normal_idx"], info["U"], info["S"], info["right_proj"], info["gram"], info["rhs"], gram, rhs, gram_reg, solved, m_opt
+            info["gram"] = info["rhs"] = gram = rhs = gram_reg = solved = m_opt = old_w = None
+            del info["normal_idx"], info["U"], info["S"], info["right_proj"], info["gram"], info["rhs"], gram, rhs, gram_reg, solved, m_opt, old_w
             torch.cuda.empty_cache()
+
+    if len(sam_rel_updates) > 0:
+        rel_tensor = torch.tensor(sam_rel_updates, dtype=torch.float32)
+        print(
+            "SAM relative update stats: "
+            f"mean={rel_tensor.mean().item():.6e}, "
+            f"min={rel_tensor.min().item():.6e}, "
+            f"max={rel_tensor.max().item():.6e}"
+        )
 
     model = model.cpu()
 

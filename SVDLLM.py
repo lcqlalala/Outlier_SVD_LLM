@@ -298,9 +298,14 @@ def _iter_batches(calib_loader, max_batches=None):
 
 
 @torch.no_grad()
-def _collect_output_moments(model_name, model, decomposition_book, calib_loader, dev, max_batches=None):
+def _collect_omoa_paired_moments(model_name, model, decomposition_book, calib_loader, dev, max_batches=None):
+    """
+    Collect paired channel-wise moments on the same compressed-history inputs:
+      - comp moments: from compressed module output
+      - orig moments: reconstructed from original full-rank factors in decomposition_book
+    """
     if calib_loader is None:
-        return None
+        return None, None
 
     model = model.to(dev)
     model.eval()
@@ -309,62 +314,120 @@ def _collect_output_moments(model_name, model, decomposition_book, calib_loader,
     else:
         layers = model.model.layers
 
-    runtime = {}
-    handles = []
-    for i in range(len(layers)):
+    orig_moments = {i: {} for i in decomposition_book}
+    comp_moments = {i: {} for i in decomposition_book}
+
+    print("Start OMOA paired moment collection...")
+    for i in tqdm(range(len(layers))):
         subset = find_layers(layers[i])
+        runtime = {}
+        handles = []
+
         for name in subset:
             if i not in decomposition_book or name not in decomposition_book[i]:
                 continue
-            out_features = int(decomposition_book[i][name]["out_features"])
-            runtime[(i, name)] = {
-                "sum": torch.zeros(out_features, device=dev, dtype=torch.float32),
-                "sum_sq": torch.zeros(out_features, device=dev, dtype=torch.float32),
+            info = decomposition_book[i][name]
+            out_features = int(info["out_features"])
+            runtime[name] = {
+                "sum_orig": torch.zeros(out_features, device=dev, dtype=torch.float32),
+                "sum_sq_orig": torch.zeros(out_features, device=dev, dtype=torch.float32),
+                "sum_comp": torch.zeros(out_features, device=dev, dtype=torch.float32),
+                "sum_sq_comp": torch.zeros(out_features, device=dev, dtype=torch.float32),
                 "count": 0,
+                "normal_idx": info["normal_idx"].to(dev),
+                "outlier_idx": info["outlier_idx"].to(dev),
+                "U": info["U"].to(dev).float(),
+                "S": info["singular_values"].to(dev).float(),
+                "right_proj": info["right_proj"].to(dev).float(),
+                "outlier_weight": info["outlier_weight"].to(dev).float() if info["outlier_weight"].numel() > 0 else None,
+                "bias": info["bias"].to(dev).float() if info["bias"] is not None else None,
             }
 
-            def _make_hook(layer_idx, module_name):
-                def _hook(_module, _input, output):
-                    out = output[0] if isinstance(output, (tuple, list)) else output
-                    out = out.detach().float()
-                    if out.dim() == 2:
-                        out = out.unsqueeze(0)
-                    out = out.reshape(-1, out.shape[-1])
-                    key = (layer_idx, module_name)
-                    runtime[key]["sum"] += out.sum(dim=0)
-                    runtime[key]["sum_sq"] += (out * out).sum(dim=0)
-                    runtime[key]["count"] += out.shape[0]
-                return _hook
+        if len(runtime) == 0:
+            continue
 
-            handles.append(subset[name].register_forward_hook(_make_hook(i, name)))
+        def _make_hook(module_name):
+            def _hook(_module, input, output):
+                inp = input[0].detach().float()
+                out_comp = output[0] if isinstance(output, (tuple, list)) else output
+                out_comp = out_comp.detach().float()
 
-    for batch in _iter_batches(calib_loader, max_batches):
-        batch = {k: v.to(dev) for k, v in batch.items()}
-        model(**batch)
+                if inp.dim() == 2:
+                    inp = inp.unsqueeze(0)
+                if out_comp.dim() == 2:
+                    out_comp = out_comp.unsqueeze(0)
 
-    for handle in handles:
-        handle.remove()
+                info = runtime[module_name]
+                normal_idx = info["normal_idx"]
+                if normal_idx.numel() == inp.shape[-1]:
+                    x_normal = inp
+                else:
+                    x_normal = inp.index_select(-1, normal_idx)
 
-    output_moments = {}
-    for i in decomposition_book:
-        layer_moments = {}
-        for name in decomposition_book[i]:
-            key = (i, name)
-            if key not in runtime or runtime[key]["count"] <= 0:
+                # Reconstruct original output: y_orig = x * W_orig^T
+                # W_orig(normal part) = U diag(S) right_proj
+                z = torch.matmul(x_normal, info["right_proj"].transpose(0, 1))
+                z = z * info["S"].view(1, 1, -1)
+                out_orig = torch.matmul(z, info["U"].transpose(0, 1))
+
+                if info["outlier_idx"].numel() > 0 and info["outlier_weight"] is not None:
+                    x_outlier = inp.index_select(-1, info["outlier_idx"])
+                    out_orig = out_orig + torch.matmul(x_outlier, info["outlier_weight"].transpose(0, 1))
+
+                if info["bias"] is not None:
+                    out_orig = out_orig + info["bias"].view(1, 1, -1)
+
+                comp_2d = out_comp.reshape(-1, out_comp.shape[-1])
+                orig_2d = out_orig.reshape(-1, out_orig.shape[-1])
+
+                info["sum_comp"] += comp_2d.sum(dim=0)
+                info["sum_sq_comp"] += (comp_2d * comp_2d).sum(dim=0)
+                info["sum_orig"] += orig_2d.sum(dim=0)
+                info["sum_sq_orig"] += (orig_2d * orig_2d).sum(dim=0)
+                info["count"] += comp_2d.shape[0]
+            return _hook
+
+        for name in runtime:
+            handles.append(subset[name].register_forward_hook(_make_hook(name)))
+
+        for batch in _iter_batches(calib_loader, max_batches):
+            batch = {k: v.to(dev) for k, v in batch.items()}
+            model(**batch)
+
+        for handle in handles:
+            handle.remove()
+
+        for name in runtime:
+            info = runtime[name]
+            if info["count"] <= 0:
                 out_features = int(decomposition_book[i][name]["out_features"])
-                mu = torch.zeros(out_features, dtype=torch.float32)
-                std = torch.ones(out_features, dtype=torch.float32)
+                mu_orig = torch.zeros(out_features, dtype=torch.float32)
+                std_orig = torch.ones(out_features, dtype=torch.float32)
+                mu_comp = torch.zeros(out_features, dtype=torch.float32)
+                std_comp = torch.ones(out_features, dtype=torch.float32)
             else:
-                count = runtime[key]["count"]
-                mu = (runtime[key]["sum"] / count).cpu()
-                var = runtime[key]["sum_sq"] / count - (runtime[key]["sum"] / count) ** 2
-                var = torch.clamp(var, min=0).cpu()
-                std = torch.sqrt(var)
-            layer_moments[name] = {"mean": mu, "std": std}
-        output_moments[i] = layer_moments
+                count = info["count"]
+                mean_orig = info["sum_orig"] / count
+                var_orig = info["sum_sq_orig"] / count - mean_orig * mean_orig
+                mean_comp = info["sum_comp"] / count
+                var_comp = info["sum_sq_comp"] / count - mean_comp * mean_comp
+                mu_orig = mean_orig.cpu()
+                std_orig = torch.sqrt(torch.clamp(var_orig, min=0)).cpu()
+                mu_comp = mean_comp.cpu()
+                std_comp = torch.sqrt(torch.clamp(var_comp, min=0)).cpu()
+
+            orig_moments[i][name] = {"mean": mu_orig, "std": std_orig}
+            comp_moments[i][name] = {"mean": mu_comp, "std": std_comp}
+
+            info["sum_orig"] = info["sum_sq_orig"] = None
+            info["sum_comp"] = info["sum_sq_comp"] = None
+            info["normal_idx"] = info["outlier_idx"] = None
+            info["U"] = info["S"] = info["right_proj"] = None
+            info["outlier_weight"] = info["bias"] = None
+            torch.cuda.empty_cache()
 
     model = model.cpu()
-    return output_moments
+    return orig_moments, comp_moments
 
 
 @torch.no_grad()
@@ -399,7 +462,13 @@ def _fuse_omoa_alignment(model_name, model, decomposition_book, orig_moments, co
                 scale = torch.clamp(scale, min=min_scale, max=max_scale)
             bias_delta = mu_orig - scale * mu_comp
 
-            scale_w = scale.to(dtype=module.outlier_proj.weight.dtype if module.has_outlier else module.u_proj.weight.dtype)
+            if module.has_outlier:
+                target_dtype = module.outlier_proj.weight.dtype
+            elif module.has_low_rank:
+                target_dtype = module.u_proj.weight.dtype
+            else:
+                target_dtype = torch.float32
+            scale_w = scale.to(dtype=target_dtype)
 
             if module.has_low_rank:
                 module.u_proj.weight.data = module.u_proj.weight.data * scale_w.unsqueeze(1).to(module.u_proj.weight.device)
@@ -627,21 +696,6 @@ def whitening(
                 target_rank = decomposition_book[i][name]["target_rank"]
                 decomposition_book[i][name]["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
 
-    orig_output_moments = None
-    if enable_omoa:
-        if calib_loader is None:
-            print("Warning: OMOA is enabled, but no calibration loader is provided. Skipping OMOA.")
-        else:
-            print("Start OMOA: collect original output moments...")
-            orig_output_moments = _collect_output_moments(
-                model_name=model_name,
-                model=model,
-                decomposition_book=decomposition_book,
-                calib_loader=calib_loader,
-                dev=dev,
-                max_batches=omoa_max_batches,
-            )
-
     print("Start reconstruction with selected stable directions...")
     ecsvr_scales = []
     for i in tqdm(range(len(layers))):
@@ -701,27 +755,30 @@ def whitening(
             del U_sel, S_sel, right_proj_sel, sqrt_s, svd_u, svd_v
             torch.cuda.empty_cache()
 
-    if enable_omoa and orig_output_moments is not None:
-        print("Start OMOA: collect compressed output moments...")
-        comp_output_moments = _collect_output_moments(
-            model_name=model_name,
-            model=model,
-            decomposition_book=decomposition_book,
-            calib_loader=calib_loader,
-            dev=dev,
-            max_batches=omoa_max_batches,
-        )
-        print("Start OMOA: fuse scale and bias into compressed layers...")
-        _fuse_omoa_alignment(
-            model_name=model_name,
-            model=model,
-            decomposition_book=decomposition_book,
-            orig_moments=orig_output_moments,
-            comp_moments=comp_output_moments,
-            dev=dev,
-            eps=omoa_eps,
-            max_scale=omoa_max_scale,
-        )
+    if enable_omoa:
+        if calib_loader is None:
+            print("Warning: OMOA is enabled, but no calibration loader is provided. Skipping OMOA.")
+        else:
+            print("Start OMOA: collect paired moments on compressed-history inputs...")
+            orig_output_moments, comp_output_moments = _collect_omoa_paired_moments(
+                model_name=model_name,
+                model=model,
+                decomposition_book=decomposition_book,
+                calib_loader=calib_loader,
+                dev=dev,
+                max_batches=omoa_max_batches,
+            )
+            print("Start OMOA: fuse scale and bias into compressed layers...")
+            _fuse_omoa_alignment(
+                model_name=model_name,
+                model=model,
+                decomposition_book=decomposition_book,
+                orig_moments=orig_output_moments,
+                comp_moments=comp_output_moments,
+                dev=dev,
+                eps=omoa_eps,
+                max_scale=omoa_max_scale,
+            )
     if enable_ecsvr and len(ecsvr_scales) > 0:
         gamma_tensor = torch.tensor(ecsvr_scales, dtype=torch.float32)
         print(

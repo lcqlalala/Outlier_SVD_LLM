@@ -298,10 +298,21 @@ def _iter_batches(calib_loader, max_batches=None):
 
 
 @torch.no_grad()
-def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_damp=1e-4, sam_max_batches=None):
+def _apply_sam(
+    model_name,
+    model,
+    decomposition_book,
+    calib_loader,
+    dev,
+    sam_damp=1e-4,
+    sam_max_batches=None,
+    enable_ecsvr=False,
+    ecsvr_max_scale=None,
+):
     """
-    Subspace Activation Matching (SAM):
-    keep v_proj fixed, solve optimal u_proj.weight in least-squares sense.
+    Energy-Conserving Joint-SAM:
+    solve u_proj and outlier_proj jointly with fixed v_proj, then optionally
+    apply post-SAM energy compensation to avoid undoing EC-SVR.
     """
     if calib_loader is None:
         print("Warning: SAM is enabled, but no calibration loader is provided. Skipping SAM.")
@@ -314,9 +325,10 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
     else:
         layers = model.model.layers
 
-    print("Start SAM: least-squares refit for up-projection...")
+    print("Start Joint-SAM: Energy-Conserving least-squares refit...")
     sam_rel_updates = []
     sam_total_modules = 0
+
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         runtime = {}
@@ -331,22 +343,27 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
                 module = getattr(parent_module, leaf_name)
             except Exception:
                 continue
-            info = decomposition_book[i][name]
-            if not isinstance(module, StableSVDLinear):
-                continue
-            if not module.has_low_rank:
+            if not isinstance(module, StableSVDLinear) or (not module.has_low_rank):
                 continue
 
-            rank = int(module.rank)
-            out_features = int(info["out_features"])
+            info = decomposition_book[i][name]
+            outlier_weight = info["outlier_weight"]
+            if outlier_weight is not None and outlier_weight.numel() > 0:
+                outlier_weight = outlier_weight.to(dev).float()
+            else:
+                outlier_weight = None
+
             runtime[name] = {
+                "module": module,
                 "normal_idx": info["normal_idx"].to(dev),
+                "outlier_idx": info["outlier_idx"].to(dev),
+                "outlier_weight": outlier_weight,
                 "U": info["U"].to(dev).float(),
                 "S": info["singular_values"].to(dev).float(),
                 "right_proj": info["right_proj"].to(dev).float(),
-                "gram": torch.zeros((rank, rank), device=dev, dtype=torch.float32),
-                "rhs": torch.zeros((out_features, rank), device=dev, dtype=torch.float32),
-                "module": module,
+                "gram": None,
+                "rhs": None,
+                "target_energy": 0.0,
             }
             sam_total_modules += 1
 
@@ -358,27 +375,38 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
                 inp = input[0].detach().float()
                 if inp.dim() == 2:
                     inp = inp.unsqueeze(0)
+                inp_2d = inp.reshape(-1, inp.shape[-1])
 
                 info = runtime[module_name]
                 normal_idx = info["normal_idx"]
-                if normal_idx.numel() == inp.shape[-1]:
-                    x_normal = inp
-                else:
-                    x_normal = inp.index_select(-1, normal_idx)
+                outlier_idx = info["outlier_idx"]
+                x_normal = inp_2d if normal_idx.numel() == inp_2d.shape[-1] else inp_2d.index_select(-1, normal_idx)
+                x_outlier = inp_2d.index_select(-1, outlier_idx) if outlier_idx.numel() > 0 else None
 
-                # Fixed subspace feature from compressed model: Z = X * V_k^T
+                # Fixed low-rank features under current compressed branch.
                 z = torch.matmul(x_normal, module.v_proj.weight.detach().float().transpose(0, 1))
+                c = torch.cat([z, x_outlier], dim=-1) if x_outlier is not None else z
 
-                # Target normal-branch output from original decomposition:
-                # Y_target = X * (U diag(S) right_proj)^T
+                # Golden target: original normal branch + original outlier branch.
                 z_full = torch.matmul(x_normal, info["right_proj"].transpose(0, 1))
-                z_full = z_full * info["S"].view(1, 1, -1)
+                z_full = z_full * info["S"].view(1, -1)
                 y_target = torch.matmul(z_full, info["U"].transpose(0, 1))
+                if x_outlier is not None and info["outlier_weight"] is not None:
+                    y_target = y_target + torch.matmul(x_outlier, info["outlier_weight"].transpose(0, 1))
 
-                z_2d = z.reshape(-1, z.shape[-1])
-                y_2d = y_target.reshape(-1, y_target.shape[-1])
-                info["gram"] += torch.matmul(z_2d.transpose(0, 1), z_2d)
-                info["rhs"] += torch.matmul(y_2d.transpose(0, 1), z_2d)
+                # Keep SAM purely on weights: remove fixed bias contribution.
+                if module.u_proj.bias is not None:
+                    y_target = y_target - module.u_proj.bias.detach().float().view(1, -1)
+
+                if info["gram"] is None:
+                    k = c.shape[-1]
+                    info["gram"] = torch.zeros((k, k), device=dev, dtype=torch.float32)
+                    info["rhs"] = torch.zeros((y_target.shape[-1], k), device=dev, dtype=torch.float32)
+
+                info["gram"] += torch.matmul(c.transpose(0, 1), c)
+                info["rhs"] += torch.matmul(y_target.transpose(0, 1), c)
+                info["target_energy"] += float((y_target * y_target).sum().item())
+
             return _hook
 
         for name in runtime:
@@ -396,34 +424,50 @@ def _apply_sam(model_name, model, decomposition_book, calib_loader, dev, sam_dam
             module = info["module"]
             gram = info["gram"]
             rhs = info["rhs"]
-            rank = gram.shape[0]
-
-            if rank <= 0:
+            if gram is None or rhs is None or gram.shape[0] <= 0:
                 continue
 
+            k = gram.shape[0]
             trace = torch.trace(gram)
-            damp = sam_damp * (trace / max(rank, 1))
-            identity = torch.eye(rank, device=dev, dtype=gram.dtype)
-            gram_reg = gram + damp * identity
+            damp = sam_damp * (trace / max(k, 1))
+            gram_reg = gram + damp * torch.eye(k, device=dev, dtype=gram.dtype)
 
             try:
-                # Solve gram_reg * X = rhs^T, then M = X^T
                 solved = torch.linalg.solve(gram_reg, rhs.transpose(0, 1))
             except Exception:
                 solved = torch.matmul(torch.linalg.pinv(gram_reg), rhs.transpose(0, 1))
-            m_opt = solved.transpose(0, 1)
-            old_w = module.u_proj.weight.data.detach().float()
-            rel_update = torch.norm(m_opt - old_w) / (torch.norm(old_w) + 1e-12)
-            sam_rel_updates.append(rel_update.item())
+            w_joint = solved.transpose(0, 1)  # [d_out, rank + n_outlier]
 
-            module.u_proj.weight.data = m_opt.to(
+            if enable_ecsvr:
+                target_e = info["target_energy"]
+                pred_e = float((torch.matmul(w_joint, gram) * w_joint).sum().item())
+                if target_e > 1e-12 and pred_e > 1e-12:
+                    gamma = (target_e / pred_e) ** 0.5
+                    if ecsvr_max_scale is not None and ecsvr_max_scale > 0:
+                        gamma = min(gamma, float(ecsvr_max_scale))
+                    w_joint = w_joint * gamma
+
+            rank = int(module.rank)
+            old_u = module.u_proj.weight.data.detach().float()
+            old_joint = old_u
+            if module.has_outlier and module.outlier_proj is not None:
+                old_out = module.outlier_proj.weight.data.detach().float()
+                old_joint = torch.cat([old_u, old_out], dim=1)
+
+            module.u_proj.weight.data = w_joint[:, :rank].to(
                 dtype=module.u_proj.weight.dtype,
                 device=module.u_proj.weight.device,
             )
+            if module.has_outlier and module.outlier_proj is not None and w_joint.shape[1] > rank:
+                module.outlier_proj.weight.data = w_joint[:, rank:].to(
+                    dtype=module.outlier_proj.weight.dtype,
+                    device=module.outlier_proj.weight.device,
+                )
 
-            info["normal_idx"] = info["U"] = info["S"] = info["right_proj"] = info["module"] = None
-            info["gram"] = info["rhs"] = gram = rhs = gram_reg = solved = m_opt = old_w = None
-            del info["normal_idx"], info["U"], info["S"], info["right_proj"], info["module"], info["gram"], info["rhs"], gram, rhs, gram_reg, solved, m_opt, old_w
+            rel_update = torch.norm(w_joint - old_joint.to(w_joint.device)) / (torch.norm(old_joint) + 1e-12)
+            sam_rel_updates.append(float(rel_update.item()))
+
+            runtime[name] = None
             torch.cuda.empty_cache()
 
     if sam_total_modules == 0:
@@ -712,6 +756,8 @@ def whitening(
             dev=dev,
             sam_damp=sam_damp,
             sam_max_batches=sam_max_batches,
+            enable_ecsvr=enable_ecsvr,
+            ecsvr_max_scale=ecsvr_max_scale,
         )
 
 

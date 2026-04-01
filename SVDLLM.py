@@ -310,9 +310,9 @@ def _apply_sam(
     ecsvr_max_scale=None,
 ):
     """
-    Energy-Conserving Joint-SAM:
-    solve u_proj and outlier_proj jointly with fixed v_proj, then optionally
-    apply post-SAM energy compensation to avoid undoing EC-SVR.
+    Decoupled EC-SAM (Energy-Conserving SAM):
+    safely refit low-rank up-projection with fixed v_proj, keep outlier branch untouched,
+    and apply post-SAM energy compensation.
     """
     if calib_loader is None:
         print("Warning: SAM is enabled, but no calibration loader is provided. Skipping SAM.")
@@ -325,7 +325,7 @@ def _apply_sam(
     else:
         layers = model.model.layers
 
-    print("Start Joint-SAM: Energy-Conserving least-squares refit...")
+    print("Start Decoupled EC-SAM: Safely recalibrating low-rank subspace...")
     sam_rel_updates = []
     sam_total_modules = 0
 
@@ -347,17 +347,9 @@ def _apply_sam(
                 continue
 
             info = decomposition_book[i][name]
-            outlier_weight = info["outlier_weight"]
-            if outlier_weight is not None and outlier_weight.numel() > 0:
-                outlier_weight = outlier_weight.to(dev).float()
-            else:
-                outlier_weight = None
-
             runtime[name] = {
                 "module": module,
                 "normal_idx": info["normal_idx"].to(dev),
-                "outlier_idx": info["outlier_idx"].to(dev),
-                "outlier_weight": outlier_weight,
                 "U": info["U"].to(dev).float(),
                 "S": info["singular_values"].to(dev).float(),
                 "right_proj": info["right_proj"].to(dev).float(),
@@ -379,33 +371,24 @@ def _apply_sam(
 
                 info = runtime[module_name]
                 normal_idx = info["normal_idx"]
-                outlier_idx = info["outlier_idx"]
                 x_normal = inp_2d if normal_idx.numel() == inp_2d.shape[-1] else inp_2d.index_select(-1, normal_idx)
-                x_outlier = inp_2d.index_select(-1, outlier_idx) if outlier_idx.numel() > 0 else None
 
                 # Fixed low-rank features under current compressed branch.
                 z = torch.matmul(x_normal, module.v_proj.weight.detach().float().transpose(0, 1))
-                c = torch.cat([z, x_outlier], dim=-1) if x_outlier is not None else z
 
-                # Golden target: original normal branch + original outlier branch.
+                # Golden target: ideal normal-branch output only.
                 z_full = torch.matmul(x_normal, info["right_proj"].transpose(0, 1))
                 z_full = z_full * info["S"].view(1, -1)
-                y_target = torch.matmul(z_full, info["U"].transpose(0, 1))
-                if x_outlier is not None and info["outlier_weight"] is not None:
-                    y_target = y_target + torch.matmul(x_outlier, info["outlier_weight"].transpose(0, 1))
-
-                # Keep SAM purely on weights: remove fixed bias contribution.
-                if module.u_proj.bias is not None:
-                    y_target = y_target - module.u_proj.bias.detach().float().view(1, -1)
+                y_ideal = torch.matmul(z_full, info["U"].transpose(0, 1))
 
                 if info["gram"] is None:
-                    k = c.shape[-1]
+                    k = z.shape[-1]
                     info["gram"] = torch.zeros((k, k), device=dev, dtype=torch.float32)
-                    info["rhs"] = torch.zeros((y_target.shape[-1], k), device=dev, dtype=torch.float32)
+                    info["rhs"] = torch.zeros((y_ideal.shape[-1], k), device=dev, dtype=torch.float32)
 
-                info["gram"] += torch.matmul(c.transpose(0, 1), c)
-                info["rhs"] += torch.matmul(y_target.transpose(0, 1), c)
-                info["target_energy"] += float((y_target * y_target).sum().item())
+                info["gram"] += torch.matmul(z.transpose(0, 1), z)
+                info["rhs"] += torch.matmul(y_ideal.transpose(0, 1), z)
+                info["target_energy"] += float((y_ideal * y_ideal).sum().item())
 
             return _hook
 
@@ -436,35 +419,23 @@ def _apply_sam(
                 solved = torch.linalg.solve(gram_reg, rhs.transpose(0, 1))
             except Exception:
                 solved = torch.matmul(torch.linalg.pinv(gram_reg), rhs.transpose(0, 1))
-            w_joint = solved.transpose(0, 1)  # [d_out, rank + n_outlier]
+            w_u = solved.transpose(0, 1)  # [d_out, rank]
 
             if enable_ecsvr:
                 target_e = info["target_energy"]
-                pred_e = float((torch.matmul(w_joint, gram) * w_joint).sum().item())
+                pred_e = float((torch.matmul(w_u, gram) * w_u).sum().item())
                 if target_e > 1e-12 and pred_e > 1e-12:
                     gamma = (target_e / pred_e) ** 0.5
                     if ecsvr_max_scale is not None and ecsvr_max_scale > 0:
                         gamma = min(gamma, float(ecsvr_max_scale))
-                    w_joint = w_joint * gamma
+                    w_u = w_u * gamma
 
-            rank = int(module.rank)
             old_u = module.u_proj.weight.data.detach().float()
-            old_joint = old_u
-            if module.has_outlier and module.outlier_proj is not None:
-                old_out = module.outlier_proj.weight.data.detach().float()
-                old_joint = torch.cat([old_u, old_out], dim=1)
-
-            module.u_proj.weight.data = w_joint[:, :rank].to(
+            module.u_proj.weight.data = w_u.to(
                 dtype=module.u_proj.weight.dtype,
                 device=module.u_proj.weight.device,
             )
-            if module.has_outlier and module.outlier_proj is not None and w_joint.shape[1] > rank:
-                module.outlier_proj.weight.data = w_joint[:, rank:].to(
-                    dtype=module.outlier_proj.weight.dtype,
-                    device=module.outlier_proj.weight.device,
-                )
-
-            rel_update = torch.norm(w_joint - old_joint.to(w_joint.device)) / (torch.norm(old_joint) + 1e-12)
+            rel_update = torch.norm(w_u - old_u.to(w_u.device)) / (torch.norm(old_u) + 1e-12)
             sam_rel_updates.append(float(rel_update.item()))
 
             runtime[name] = None
@@ -476,9 +447,8 @@ def _apply_sam(
         rel_tensor = torch.tensor(sam_rel_updates, dtype=torch.float32)
         print(
             "SAM relative update stats: "
-            f"mean={rel_tensor.mean().item():.6e}, "
-            f"min={rel_tensor.min().item():.6e}, "
-            f"max={rel_tensor.max().item():.6e}"
+            f"mean={rel_tensor.mean().item():.6f}, "
+            f"max={rel_tensor.max().item():.6f}"
         )
 
     model = model.cpu()

@@ -749,6 +749,9 @@ def _apply_sg_cealc_refit(
     total = 0
     applied = 0
     skipped = 0
+    skipped_cond = 0
+    skipped_val = 0
+    skipped_no_val_signal = 0
 
     for i in tqdm(range(len(layers))):
         if i not in decomposition_book:
@@ -907,6 +910,7 @@ def _apply_sg_cealc_refit(
             cond_val = float((eigvals[-1] / torch.clamp(eigvals[0], min=1e-12)).item())
             if cond_val > sg_cealc_max_cond:
                 skipped += 1
+                skipped_cond += 1
                 continue
 
             U = info["U"].to(dev).float()
@@ -1015,6 +1019,7 @@ def _apply_sg_cealc_refit(
                 count = val_error[name]["count"]
                 if count <= 0:
                     skipped += 1
+                    skipped_no_val_signal += 1
                     continue
                 mse_old = val_error[name]["old"] / max(count, 1)
                 mse_new = val_error[name]["new"] / max(count, 1)
@@ -1022,6 +1027,7 @@ def _apply_sg_cealc_refit(
                     accepted.add(name)
                 else:
                     skipped += 1
+                    skipped_val += 1
 
         layer_has_update = False
         for name, cand in candidates.items():
@@ -1055,7 +1061,11 @@ def _apply_sg_cealc_refit(
         student_layer_old = student_layer_old.cpu()
         torch.cuda.empty_cache()
 
-    print(f"SG-CEALC gate stats: total={total}, applied={applied}, skipped={skipped}")
+    print(
+        "SG-CEALC gate stats: "
+        f"total={total}, applied={applied}, skipped={skipped}, "
+        f"cond={skipped_cond}, val={skipped_val}, no_val_signal={skipped_no_val_signal}"
+    )
 
 @torch.no_grad()
 def whitening(

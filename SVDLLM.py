@@ -631,6 +631,7 @@ def _capture_decoder_inputs_for_sg_cealc(model_name, model, calib_loader, dev, m
 
 def _build_stable_linear_from_info(info, ref_module, dev):
     selected_idx = _resolve_selected_idx(info, dev)
+    selected_idx_cpu = selected_idx.cpu()
     new_linear = StableSVDLinear(
         in_features=info["in_features"],
         out_features=info["out_features"],
@@ -641,9 +642,9 @@ def _build_stable_linear_from_info(info, ref_module, dev):
     ).to(dtype=ref_module.weight.dtype, device=ref_module.weight.device)
 
     if selected_idx.numel() > 0 and new_linear.has_low_rank:
-        U_sel = info["U"][:, selected_idx].float()
-        S_sel = info["singular_values"][selected_idx].float()
-        R_sel = info["right_proj"][selected_idx, :].float()
+        U_sel = info["U"][:, selected_idx_cpu].float()
+        S_sel = info["singular_values"][selected_idx_cpu].float()
+        R_sel = info["right_proj"][selected_idx_cpu, :].float()
         sqrt_s = torch.sqrt(torch.clamp(S_sel, min=0))
         svd_u = U_sel * sqrt_s.unsqueeze(0)
         svd_v = R_sel * sqrt_s.unsqueeze(1)

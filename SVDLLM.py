@@ -575,6 +575,108 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
 
 
 @torch.no_grad()
+def _apply_sg_cealc_refit(
+    decomposition_book,
+    profiling_mat,
+    dev,
+    sg_cealc_beta=0.05,
+    sg_cealc_eta=0.1,
+):
+    """
+    SG-CEALC-Lite:
+    refine Stage-2 decomposition target using stability-gated proxy Delta in input space:
+      Delta_tilde = P_stable * Delta * P_stable + eta * P_unstable * Delta * P_stable
+    then decompose W * A where A = (H + beta * Delta_tilde) * L^{-1}.
+    """
+    if sg_cealc_beta == 0:
+        return
+
+    print("Start SG-CEALC refinement on Stage 2 target...")
+    for i in tqdm(decomposition_book.keys()):
+        for name in decomposition_book[i]:
+            info = decomposition_book[i][name]
+            normal_idx = info["normal_idx"].to(dev)
+            if normal_idx.numel() == 0:
+                continue
+
+            # Rebuild normal-space Cholesky L from profiling matrix.
+            scaling_diag_matrix_full = profiling_mat[i][name].to(dev).float()
+            if normal_idx.numel() == scaling_diag_matrix_full.shape[0]:
+                L = scaling_diag_matrix_full
+            else:
+                cov_full = torch.matmul(scaling_diag_matrix_full, scaling_diag_matrix_full.transpose(0, 1))
+                cov_normal = cov_full.index_select(0, normal_idx).index_select(1, normal_idx)
+                L = _safe_cholesky(cov_normal, dev)
+                cov_full = cov_normal = None
+                del cov_full, cov_normal
+
+            H = torch.matmul(L, L.transpose(0, 1))
+            L_inv = _safe_inverse(L, dev).float()
+
+            # Recover current normal weight and right basis.
+            U = info["U"].to(dev).float()
+            S = info["singular_values"].to(dev).float()
+            R = info["right_proj"].to(dev).float()  # shape: [rank_full, d_normal]
+            W_normal = torch.matmul(U * S.unsqueeze(0), R)
+
+            selected_idx = info["selected_idx"].to(dev).long()
+            if selected_idx.numel() == 0:
+                k = min(info["target_rank"], S.numel())
+                selected_idx = torch.arange(k, device=dev, dtype=torch.long)
+            if selected_idx.numel() == 0:
+                continue
+
+            all_idx = torch.arange(S.numel(), device=dev, dtype=torch.long)
+            unstable_mask = torch.ones_like(all_idx, dtype=torch.bool)
+            unstable_mask[selected_idx] = False
+            unstable_idx = all_idx[unstable_mask]
+
+            # Stable projector in input space from stable right directions.
+            R_stable = R.index_select(0, selected_idx)
+            q_stable, _ = torch.linalg.qr(R_stable.transpose(0, 1), mode='reduced')
+            P_stable = torch.matmul(q_stable, q_stable.transpose(0, 1))
+            I = torch.eye(P_stable.shape[0], device=dev, dtype=P_stable.dtype)
+            P_unstable = I - P_stable
+
+            # Proxy Delta from unstable directions (energy-weighted).
+            if unstable_idx.numel() > 0:
+                R_unstable = R.index_select(0, unstable_idx)
+                s_unstable = S.index_select(0, unstable_idx)
+                delta_proxy = torch.matmul((R_unstable.transpose(0, 1) * (s_unstable * s_unstable)), R_unstable)
+            else:
+                delta_proxy = torch.zeros_like(H)
+
+            delta_tilde = torch.matmul(P_stable, torch.matmul(delta_proxy, P_stable))
+            if sg_cealc_eta != 0:
+                delta_tilde = delta_tilde + sg_cealc_eta * torch.matmul(P_unstable, torch.matmul(delta_proxy, P_stable))
+            delta_tilde = 0.5 * (delta_tilde + delta_tilde.transpose(0, 1))
+
+            M = H + sg_cealc_beta * delta_tilde
+            M = 0.5 * (M + M.transpose(0, 1))
+            M = M + 1e-6 * torch.eye(M.shape[0], device=dev, dtype=M.dtype)
+            A = torch.matmul(M, L_inv)
+            A_inv = _safe_inverse(A, dev).float()
+
+            W_scale = torch.matmul(W_normal, A)
+            U_new, S_new, VT_new = torch.linalg.svd(W_scale, full_matrices=False)
+            right_proj_new = torch.matmul(VT_new, A_inv)
+            proj_matrix_new = S_new.unsqueeze(1) * right_proj_new
+
+            info["U"] = U_new.cpu()
+            info["singular_values"] = S_new.cpu()
+            info["right_proj"] = right_proj_new.cpu()
+            info["proj_matrix"] = proj_matrix_new.cpu()
+
+            scaling_diag_matrix_full = L = H = L_inv = None
+            U = S = R = W_normal = None
+            q_stable = P_stable = P_unstable = I = None
+            delta_proxy = delta_tilde = M = A = A_inv = None
+            W_scale = U_new = S_new = VT_new = right_proj_new = proj_matrix_new = None
+            del scaling_diag_matrix_full, L, H, L_inv, U, S, R, W_normal, q_stable, P_stable, P_unstable, I, delta_proxy, delta_tilde, M, A, A_inv, W_scale, U_new, S_new, VT_new, right_proj_new, proj_matrix_new
+            torch.cuda.empty_cache()
+
+
+@torch.no_grad()
 def whitening(
     model_name,
     model,
@@ -588,6 +690,9 @@ def whitening(
     enable_stage3=False,
     stage3_lambda=1.0,
     stage3_max_batches=None,
+    enable_sg_cealc=False,
+    sg_cealc_beta=0.05,
+    sg_cealc_eta=0.1,
     enable_ecsvr=False,
     ecsvr_max_scale=None,
     enable_sam=False,
@@ -679,6 +784,32 @@ def whitening(
             for name in decomposition_book[i]:
                 target_rank = decomposition_book[i][name]["target_rank"]
                 decomposition_book[i][name]["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
+
+    if enable_sg_cealc:
+        _apply_sg_cealc_refit(
+            decomposition_book=decomposition_book,
+            profiling_mat=profiling_mat,
+            dev=dev,
+            sg_cealc_beta=sg_cealc_beta,
+            sg_cealc_eta=sg_cealc_eta,
+        )
+        # Re-run Stage 3 on refined decomposition so direction selection remains
+        # consistent with the updated Stage-2 target.
+        if enable_stage3:
+            _collect_stage3_scores(
+                model_name=model_name,
+                model=model,
+                decomposition_book=decomposition_book,
+                calib_loader=calib_loader,
+                stability_lambda=stage3_lambda,
+                dev=dev,
+                stage3_max_batches=stage3_max_batches,
+            )
+        else:
+            for i in decomposition_book:
+                for name in decomposition_book[i]:
+                    target_rank = decomposition_book[i][name]["target_rank"]
+                    decomposition_book[i][name]["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
 
     print("Start reconstruction with selected stable directions...")
     ecsvr_scales = []
@@ -999,6 +1130,9 @@ if __name__ == '__main__':
     parser.add_argument('--enable_stage3', action='store_true', help='Stage 3: enable cross-sample stability selection')
     parser.add_argument('--stage3_lambda', type=float, default=1.0, help='Stage 3: variance penalty coefficient in stability score')
     parser.add_argument('--stage3_max_batches', type=int, default=None, help='Stage 3: optionally limit number of calibration batches for stability scoring')
+    parser.add_argument('--enable_sg_cealc', action='store_true', help='Enable SG-CEALC refinement in Stage 2 target')
+    parser.add_argument('--sg_cealc_beta', type=float, default=0.05, help='SG-CEALC: compensation strength for gated Delta')
+    parser.add_argument('--sg_cealc_eta', type=float, default=0.1, help='SG-CEALC: unstable-to-stable cross-term scaling')
     parser.add_argument('--enable_ecsvr', action='store_true', help='Enable EC-SVR: energy-conserving singular value recalibration after truncation')
     parser.add_argument('--ecsvr_max_scale', type=float, default=None, help='Optional cap for EC-SVR gamma to avoid over-amplification (e.g., 1.5)')
     parser.add_argument('--enable_sam', action='store_true', help='Enable SAM: refit up-projection by least squares with fixed subspace projection')
@@ -1057,6 +1191,9 @@ if __name__ == '__main__':
             enable_stage3=args.enable_stage3,
             stage3_lambda=args.stage3_lambda,
             stage3_max_batches=args.stage3_max_batches,
+            enable_sg_cealc=args.enable_sg_cealc,
+            sg_cealc_beta=args.sg_cealc_beta,
+            sg_cealc_eta=args.sg_cealc_eta,
             enable_ecsvr=args.enable_ecsvr,
             ecsvr_max_scale=args.ecsvr_max_scale,
             enable_sam=args.enable_sam,

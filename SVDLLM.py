@@ -675,6 +675,17 @@ def _build_compressed_layer_from_book(layer, layer_book, dev):
     return layer_student
 
 
+def _resolve_modules_by_name(root_module, module_names):
+    resolved = {}
+    for name in module_names:
+        try:
+            parent_module, leaf_name = _get_parent_module(root_module, name)
+            resolved[name] = getattr(parent_module, leaf_name)
+        except Exception:
+            continue
+    return resolved
+
+
 @torch.no_grad()
 def _apply_sg_cealc_refit(
     model_name,
@@ -748,8 +759,9 @@ def _apply_sg_cealc_refit(
 
         teacher_layer = layers[i].to(dev).eval()
         student_layer_old = _build_compressed_layer_from_book(teacher_layer, layer_book, dev).eval()
-        teacher_subset = find_layers(teacher_layer)
-        student_subset = find_layers(student_layer_old)
+        candidate_names = list(layer_book.keys())
+        teacher_subset = _resolve_modules_by_name(teacher_layer, candidate_names)
+        student_subset = _resolve_modules_by_name(student_layer_old, candidate_names)
 
         runtime = {}
         module_names = []
@@ -785,6 +797,13 @@ def _apply_sg_cealc_refit(
                 "Delta": torch.zeros((normal_idx.numel(), normal_idx.numel()), device=dev, dtype=torch.float32),
             }
             module_names.append(name)
+
+        if len(module_names) == 0:
+            print(f"Warning: SG-CEALC found no matched modules at layer {i}, skipping this layer.")
+            layers[i] = teacher_layer.cpu()
+            student_layer_old = student_layer_old.cpu()
+            torch.cuda.empty_cache()
+            continue
 
         teacher_cache_inputs = {}
         student_cache_inputs = {}

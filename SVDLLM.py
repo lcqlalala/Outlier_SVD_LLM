@@ -7,6 +7,7 @@ import torch.jit
 from tqdm import tqdm
 import torch
 import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.data_utils import *
 from component.svd_llama import SVD_LlamaAttention, SVD_LlamaMLP
@@ -1008,7 +1009,15 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.ratio = 1- args.ratio
     if args.step == 1:
-        model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        # model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        
+        model_load_dtype = torch.float16
+        model = AutoModelForCausalLM.from_pretrained('/data1/common/llm-models/llama-7b', torch_dtype=model_load_dtype)
+        tokenizer = AutoTokenizer.from_pretrained('/data1/common/llm-models/llama-7b')
+        if hasattr(model.config, "max_position_embeddings"):
+            model.seqlen = model.config.max_position_embeddings
+        else:
+            model.seqlen = 2048
         model = model.eval()
         need_outlier_stats = args.stage1_outlier_ratio > 0 and args.stage1_outlier_criterion == "infinity_norm"
         cali_white_data = None

@@ -311,11 +311,9 @@ def _apply_sam(
     ecsvr_max_scale=None,
 ):
     """
-    SPPR (Subspace-Projected Prior-Ridge Refit):
-    1) project teacher normal output onto kept output subspace,
-    2) solve prior-ridge refit around current u_proj (trust-region style),
-    3) per-layer rollback gate: accept only if projected-target fit improves
-       and relative update is bounded.
+    Decoupled EC-SAM (Energy-Conserving SAM):
+    safely refit low-rank up-projection with fixed v_proj, keep outlier branch untouched,
+    and apply post-SAM energy compensation.
     """
     if calib_loader is None:
         print("Warning: SAM is enabled, but no calibration loader is provided. Skipping SAM.")
@@ -328,12 +326,9 @@ def _apply_sam(
     else:
         layers = model.model.layers
 
-    print("Start SPPR: subspace-projected prior-ridge refit...")
+    print("Start Decoupled EC-SAM: Safely recalibrating low-rank subspace...")
     sam_rel_updates = []
     sam_total_modules = 0
-    sam_applied_modules = 0
-    sam_skipped_modules = 0
-    max_rel_update = 0.25
 
     for i in tqdm(range(len(layers))):
         layer = layers[i]
@@ -359,12 +354,9 @@ def _apply_sam(
                 "U": info["U"].to(dev).float(),
                 "S": info["singular_values"].to(dev).float(),
                 "right_proj": info["right_proj"].to(dev).float(),
-                "selected_idx": info["selected_idx"].to(dev).long(),
                 "gram": None,
                 "rhs": None,
                 "target_energy": 0.0,
-                "target_sq": 0.0,
-                "count": 0,
             }
             sam_total_modules += 1
 
@@ -381,30 +373,23 @@ def _apply_sam(
                 info = runtime[module_name]
                 normal_idx = info["normal_idx"]
                 x_normal = inp_2d if normal_idx.numel() == inp_2d.shape[-1] else inp_2d.index_select(-1, normal_idx)
-                selected_idx = info["selected_idx"]
 
                 # Fixed low-rank features under current compressed branch.
                 z = torch.matmul(x_normal, module.v_proj.weight.detach().float().transpose(0, 1))
 
-                # Teacher coefficients in full U basis.
+                # Golden target: ideal normal-branch output only.
                 z_full = torch.matmul(x_normal, info["right_proj"].transpose(0, 1))
                 z_full = z_full * info["S"].view(1, -1)
-                # Project teacher output onto kept output subspace to avoid
-                # fitting dropped directions that are not recoverable.
-                a_keep = z_full.index_select(-1, selected_idx)
-                u_keep = info["U"].index_select(1, selected_idx)
-                y_proj = torch.matmul(a_keep, u_keep.transpose(0, 1))
+                y_ideal = torch.matmul(z_full, info["U"].transpose(0, 1))
 
                 if info["gram"] is None:
                     k = z.shape[-1]
                     info["gram"] = torch.zeros((k, k), device=dev, dtype=torch.float32)
-                    info["rhs"] = torch.zeros((y_proj.shape[-1], k), device=dev, dtype=torch.float32)
+                    info["rhs"] = torch.zeros((y_ideal.shape[-1], k), device=dev, dtype=torch.float32)
 
                 info["gram"] += torch.matmul(z.transpose(0, 1), z)
-                info["rhs"] += torch.matmul(y_proj.transpose(0, 1), z)
-                info["target_energy"] += float((y_proj * y_proj).sum().item())
-                info["target_sq"] += float((y_proj * y_proj).sum().item())
-                info["count"] += int(z.shape[0])
+                info["rhs"] += torch.matmul(y_ideal.transpose(0, 1), z)
+                info["target_energy"] += float((y_ideal * y_ideal).sum().item())
 
             return _hook
 
@@ -423,20 +408,18 @@ def _apply_sam(
             module = info["module"]
             gram = info["gram"]
             rhs = info["rhs"]
-            if gram is None or rhs is None or gram.shape[0] <= 0 or info["count"] <= 0:
+            if gram is None or rhs is None or gram.shape[0] <= 0:
                 continue
 
             k = gram.shape[0]
-            trace = torch.trace(gram).item()
-            ridge = float(sam_damp) * (trace / max(k, 1))
-            old_u = module.u_proj.weight.data.detach().float().to(dev)
-            lhs = gram + ridge * torch.eye(k, device=dev, dtype=gram.dtype)
-            rhs_prior = rhs + ridge * old_u
+            trace = torch.trace(gram)
+            damp = sam_damp * (trace / max(k, 1))
+            gram_reg = gram + damp * torch.eye(k, device=dev, dtype=gram.dtype)
 
             try:
-                solved = torch.linalg.solve(lhs, rhs_prior.transpose(0, 1))
+                solved = torch.linalg.solve(gram_reg, rhs.transpose(0, 1))
             except Exception:
-                solved = torch.matmul(torch.linalg.pinv(lhs), rhs_prior.transpose(0, 1))
+                solved = torch.matmul(torch.linalg.pinv(gram_reg), rhs.transpose(0, 1))
             w_u = solved.transpose(0, 1)  # [d_out, rank]
 
             if enable_ecsvr:
@@ -448,36 +431,23 @@ def _apply_sam(
                         gamma = min(gamma, float(ecsvr_max_scale))
                     w_u = w_u * gamma
 
-            # Rollback gate on projected-target MSE + relative update bound.
-            target_sq = info["target_sq"]
-            old_fit = target_sq - 2.0 * float((old_u * rhs).sum().item()) + float((torch.matmul(old_u, gram) * old_u).sum().item())
-            new_fit = target_sq - 2.0 * float((w_u * rhs).sum().item()) + float((torch.matmul(w_u, gram) * w_u).sum().item())
-            rel_update = float((torch.norm(w_u - old_u) / (torch.norm(old_u) + 1e-12)).item())
-
-            if (new_fit <= old_fit) and (rel_update <= max_rel_update):
-                module.u_proj.weight.data = w_u.to(
-                    dtype=module.u_proj.weight.dtype,
-                    device=module.u_proj.weight.device,
-                )
-                sam_applied_modules += 1
-                sam_rel_updates.append(rel_update)
-            else:
-                sam_skipped_modules += 1
+            old_u = module.u_proj.weight.data.detach().float()
+            module.u_proj.weight.data = w_u.to(
+                dtype=module.u_proj.weight.dtype,
+                device=module.u_proj.weight.device,
+            )
+            rel_update = torch.norm(w_u - old_u.to(w_u.device)) / (torch.norm(old_u) + 1e-12)
+            sam_rel_updates.append(float(rel_update.item()))
 
             runtime[name] = None
             torch.cuda.empty_cache()
 
     if sam_total_modules == 0:
         print("Warning: SAM did not find any StableSVDLinear modules to update.")
-    else:
-        print(
-            "SPPR gate stats: "
-            f"total={sam_total_modules}, applied={sam_applied_modules}, skipped={sam_skipped_modules}"
-        )
     if len(sam_rel_updates) > 0:
         rel_tensor = torch.tensor(sam_rel_updates, dtype=torch.float32)
         print(
-            "SPPR relative update stats: "
+            "SAM relative update stats: "
             f"mean={rel_tensor.mean().item():.6f}, "
             f"max={rel_tensor.max().item():.6f}"
         )
@@ -1075,7 +1045,14 @@ if __name__ == '__main__':
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
-        model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        # model, tokenizer = get_model_from_huggingface(model_id=args.model)
+        model_load_dtype = torch.float16
+        model = AutoModelForCausalLM.from_pretrained('/data1/common/llm-models/llama-7b', torch_dtype=model_load_dtype)
+        tokenizer = AutoTokenizer.from_pretrained('/data1/common/llm-models/llama-7b')
+        if hasattr(model.config, "max_position_embeddings"):
+            model.seqlen = model.config.max_position_embeddings
+        else:
+            model.seqlen = 2048
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         model = model.eval()
         model = model.float()  # need to set to float

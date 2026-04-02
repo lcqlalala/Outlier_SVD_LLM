@@ -546,6 +546,220 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
 
 
 @torch.no_grad()
+def _collect_sg_cealc_stats(model_name, model, decomposition_book, calib_loader, dev, max_batches=None):
+    if calib_loader is None:
+        return None
+
+    model = model.to(dev)
+    model.eval()
+    if "opt" in model_name:
+        layers = model.model.decoder.layers
+    else:
+        layers = model.model.layers
+
+    stats_book = {i: {} for i in decomposition_book}
+    print("Collect SG-CEALC statistics (H, Delta)...")
+    for i in tqdm(range(len(layers))):
+        if i not in decomposition_book:
+            continue
+        subset = find_layers(layers[i])
+        runtime = {}
+        handles = []
+
+        for name in subset:
+            if name not in decomposition_book[i]:
+                continue
+            info = decomposition_book[i][name]
+            normal_idx = info["normal_idx"].to(dev)
+            if normal_idx.numel() == 0:
+                continue
+            S = info["singular_values"].to(dev).float()
+            selected_idx = info["selected_idx"].to(dev).long()
+            if selected_idx.numel() == 0:
+                k = min(info["target_rank"], S.numel())
+                selected_idx = torch.arange(k, device=dev, dtype=torch.long)
+            if selected_idx.numel() == 0:
+                continue
+
+            R = info["right_proj"].to(dev).float()
+            R_stable = R.index_select(0, selected_idx)
+            q_stable, _ = torch.linalg.qr(R_stable.transpose(0, 1), mode='reduced')
+            P_stable = torch.matmul(q_stable, q_stable.transpose(0, 1))
+            I = torch.eye(P_stable.shape[0], device=dev, dtype=P_stable.dtype)
+            P_unstable = I - P_stable
+
+            runtime[name] = {
+                "normal_idx": normal_idx,
+                "P_stable": P_stable,
+                "P_unstable": P_unstable,
+                "H": torch.zeros((normal_idx.numel(), normal_idx.numel()), device=dev, dtype=torch.float32),
+                "Delta": torch.zeros((normal_idx.numel(), normal_idx.numel()), device=dev, dtype=torch.float32),
+            }
+
+        if len(runtime) == 0:
+            continue
+
+        def _make_hook(module_name):
+            def _hook(_module, input, _output):
+                x = input[0].detach().float()
+                if x.dim() == 2:
+                    x = x.unsqueeze(0)
+                info = runtime[module_name]
+                normal_idx = info["normal_idx"]
+                x = x if normal_idx.numel() == x.shape[-1] else x.index_select(-1, normal_idx)
+                x2d = x.reshape(-1, x.shape[-1])
+                x_stable = torch.matmul(x2d, info["P_stable"])
+                x_unstable = x2d - x_stable
+                info["H"] += torch.matmul(x2d.transpose(0, 1), x2d)
+                # Delta = (X_f - X)X^T; use data-driven stable-complement proxy.
+                info["Delta"] += torch.matmul(x_unstable.transpose(0, 1), x2d)
+            return _hook
+
+        for name in runtime:
+            handles.append(subset[name].register_forward_hook(_make_hook(name)))
+
+        for batch in _iter_batches(calib_loader, max_batches):
+            batch = {k: v.to(dev) for k, v in batch.items()}
+            model(**batch)
+
+        for h in handles:
+            h.remove()
+
+        for name in runtime:
+            stats_book[i][name] = {
+                "H": runtime[name]["H"].cpu(),
+                "Delta": runtime[name]["Delta"].cpu(),
+                "P_stable": runtime[name]["P_stable"].cpu(),
+                "P_unstable": runtime[name]["P_unstable"].cpu(),
+            }
+
+    model = model.cpu()
+    return stats_book
+
+
+@torch.no_grad()
+def _apply_sg_cealc_refit(
+    model_name,
+    model,
+    decomposition_book,
+    profiling_mat,
+    calib_loader,
+    dev,
+    sg_cealc_beta=0.01,
+    sg_cealc_eta=0.05,
+    sg_cealc_max_batches=None,
+    sg_cealc_max_drift=0.15,
+    sg_cealc_max_cond=1e5,
+    sg_cealc_min_energy_ratio=0.85,
+    sg_cealc_max_energy_ratio=1.20,
+):
+    if sg_cealc_beta == 0:
+        return
+
+    stats_book = _collect_sg_cealc_stats(
+        model_name=model_name,
+        model=model,
+        decomposition_book=decomposition_book,
+        calib_loader=calib_loader,
+        dev=dev,
+        max_batches=sg_cealc_max_batches,
+    )
+    if stats_book is None:
+        print("Warning: SG-CEALC has no calibration data. Skipping.")
+        return
+
+    print("Start SG-CEALC safe refinement on Stage 2 target...")
+    total = 0
+    applied = 0
+    skipped = 0
+    for i in tqdm(decomposition_book.keys()):
+        for name in decomposition_book[i]:
+            if i not in stats_book or name not in stats_book[i]:
+                continue
+            info = decomposition_book[i][name]
+            normal_idx = info["normal_idx"].to(dev)
+            if normal_idx.numel() == 0:
+                continue
+            total += 1
+
+            # Rebuild normal-space Cholesky L from profiling matrix.
+            scaling_diag_matrix_full = profiling_mat[i][name].to(dev).float()
+            if normal_idx.numel() == scaling_diag_matrix_full.shape[0]:
+                L = scaling_diag_matrix_full
+            else:
+                cov_full = torch.matmul(scaling_diag_matrix_full, scaling_diag_matrix_full.transpose(0, 1))
+                cov_normal = cov_full.index_select(0, normal_idx).index_select(1, normal_idx)
+                L = _safe_cholesky(cov_normal, dev)
+            L_inv = _safe_inverse(L, dev).float()
+
+            H = stats_book[i][name]["H"].to(dev).float()
+            Delta = stats_book[i][name]["Delta"].to(dev).float()
+            P_stable = stats_book[i][name]["P_stable"].to(dev).float()
+            P_unstable = stats_book[i][name]["P_unstable"].to(dev).float()
+
+            delta_tilde = torch.matmul(P_stable, torch.matmul(Delta, P_stable))
+            if sg_cealc_eta != 0:
+                delta_tilde = delta_tilde + sg_cealc_eta * torch.matmul(P_unstable, torch.matmul(Delta, P_stable))
+            delta_tilde = 0.5 * (delta_tilde + delta_tilde.transpose(0, 1))
+
+            # Normalize compensation to avoid over-dominating H.
+            h_norm = torch.linalg.norm(H, ord='fro')
+            d_norm = torch.linalg.norm(delta_tilde, ord='fro')
+            if d_norm > 0:
+                delta_tilde = delta_tilde * torch.clamp(h_norm / (d_norm + 1e-12), max=1.0)
+
+            M = H + sg_cealc_beta * delta_tilde
+            M = 0.5 * (M + M.transpose(0, 1))
+            eigvals = torch.linalg.eigvalsh(M)
+            min_eig = float(eigvals[0].item())
+            if min_eig <= 1e-8:
+                M = M + (1e-6 - min_eig) * torch.eye(M.shape[0], device=dev, dtype=M.dtype)
+                eigvals = torch.linalg.eigvalsh(M)
+            cond_val = float((eigvals[-1] / torch.clamp(eigvals[0], min=1e-12)).item())
+            if cond_val > sg_cealc_max_cond:
+                skipped += 1
+                continue
+
+            # Recover current normal weight and right basis.
+            U = info["U"].to(dev).float()
+            S = info["singular_values"].to(dev).float()
+            R = info["right_proj"].to(dev).float()
+            W_old = torch.matmul(U * S.unsqueeze(0), R)
+
+            A = torch.matmul(M, L_inv)
+            A_inv = _safe_inverse(A, dev).float()
+
+            W_scale = torch.matmul(W_old, A)
+            U_new, S_new, VT_new = torch.linalg.svd(W_scale, full_matrices=False)
+            R_new = torch.matmul(VT_new, A_inv)
+            W_new = torch.matmul(U_new * S_new.unsqueeze(0), R_new)
+
+            # Rollback gate by stable-subspace drift and energy ratio.
+            C_stable = torch.matmul(P_stable, torch.matmul(H, P_stable))
+            old_energy = float((torch.matmul(W_old, C_stable) * W_old).sum().item())
+            new_energy = float((torch.matmul(W_new, C_stable) * W_new).sum().item())
+            dW = W_new - W_old
+            drift_num = float((torch.matmul(dW, C_stable) * dW).sum().item())
+            drift = (drift_num / (old_energy + 1e-12)) ** 0.5 if old_energy > 0 else 0.0
+            energy_ratio = new_energy / (old_energy + 1e-12) if old_energy > 0 else 1.0
+
+            if drift > sg_cealc_max_drift or not (sg_cealc_min_energy_ratio <= energy_ratio <= sg_cealc_max_energy_ratio):
+                skipped += 1
+                continue
+
+            proj_matrix_new = S_new.unsqueeze(1) * R_new
+            info["U"] = U_new.cpu()
+            info["singular_values"] = S_new.cpu()
+            info["right_proj"] = R_new.cpu()
+            info["proj_matrix"] = proj_matrix_new.cpu()
+            applied += 1
+
+            torch.cuda.empty_cache()
+
+    print(f"SG-CEALC gate stats: total={total}, applied={applied}, skipped={skipped}")
+
+
+@torch.no_grad()
 def whitening(
     model_name,
     model,
@@ -559,6 +773,14 @@ def whitening(
     enable_stage3=False,
     stage3_lambda=1.0,
     stage3_max_batches=None,
+    enable_sg_cealc=False,
+    sg_cealc_beta=0.01,
+    sg_cealc_eta=0.05,
+    sg_cealc_max_batches=None,
+    sg_cealc_max_drift=0.15,
+    sg_cealc_max_cond=1e5,
+    sg_cealc_min_energy_ratio=0.85,
+    sg_cealc_max_energy_ratio=1.20,
     enable_ecsvr=False,
     ecsvr_max_scale=None,
     enable_sam=False,
@@ -650,6 +872,39 @@ def whitening(
             for name in decomposition_book[i]:
                 target_rank = decomposition_book[i][name]["target_rank"]
                 decomposition_book[i][name]["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
+
+    if enable_sg_cealc:
+        _apply_sg_cealc_refit(
+            model_name=model_name,
+            model=model,
+            decomposition_book=decomposition_book,
+            profiling_mat=profiling_mat,
+            calib_loader=calib_loader,
+            dev=dev,
+            sg_cealc_beta=sg_cealc_beta,
+            sg_cealc_eta=sg_cealc_eta,
+            sg_cealc_max_batches=sg_cealc_max_batches if sg_cealc_max_batches is not None else stage3_max_batches,
+            sg_cealc_max_drift=sg_cealc_max_drift,
+            sg_cealc_max_cond=sg_cealc_max_cond,
+            sg_cealc_min_energy_ratio=sg_cealc_min_energy_ratio,
+            sg_cealc_max_energy_ratio=sg_cealc_max_energy_ratio,
+        )
+        # Re-select stable directions after SG-CEALC refit.
+        if enable_stage3:
+            _collect_stage3_scores(
+                model_name=model_name,
+                model=model,
+                decomposition_book=decomposition_book,
+                calib_loader=calib_loader,
+                stability_lambda=stage3_lambda,
+                dev=dev,
+                stage3_max_batches=stage3_max_batches,
+            )
+        else:
+            for i in decomposition_book:
+                for name in decomposition_book[i]:
+                    target_rank = decomposition_book[i][name]["target_rank"]
+                    decomposition_book[i][name]["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
 
     print("Start reconstruction with selected stable directions...")
     ecsvr_scales = []
@@ -970,6 +1225,14 @@ if __name__ == '__main__':
     parser.add_argument('--enable_stage3', action='store_true', help='Stage 3: enable cross-sample stability selection')
     parser.add_argument('--stage3_lambda', type=float, default=1.0, help='Stage 3: variance penalty coefficient in stability score')
     parser.add_argument('--stage3_max_batches', type=int, default=None, help='Stage 3: optionally limit number of calibration batches for stability scoring')
+    parser.add_argument('--enable_sg_cealc', action='store_true', help='Enable safe SG-CEALC refinement in Stage 2 target')
+    parser.add_argument('--sg_cealc_beta', type=float, default=0.01, help='SG-CEALC: compensation strength for gated Delta')
+    parser.add_argument('--sg_cealc_eta', type=float, default=0.05, help='SG-CEALC: unstable-to-stable cross-term scaling')
+    parser.add_argument('--sg_cealc_max_batches', type=int, default=None, help='SG-CEALC: calibration batches for Delta/H statistics')
+    parser.add_argument('--sg_cealc_max_drift', type=float, default=0.15, help='SG-CEALC gate: max stable-subspace drift')
+    parser.add_argument('--sg_cealc_max_cond', type=float, default=1e5, help='SG-CEALC gate: max condition number for adjusted target matrix')
+    parser.add_argument('--sg_cealc_min_energy_ratio', type=float, default=0.85, help='SG-CEALC gate: min stable energy ratio')
+    parser.add_argument('--sg_cealc_max_energy_ratio', type=float, default=1.20, help='SG-CEALC gate: max stable energy ratio')
     parser.add_argument('--enable_ecsvr', action='store_true', help='Enable EC-SVR: energy-conserving singular value recalibration after truncation')
     parser.add_argument('--ecsvr_max_scale', type=float, default=None, help='Optional cap for EC-SVR gamma to avoid over-amplification (e.g., 1.5)')
     parser.add_argument('--enable_sam', action='store_true', help='Enable SAM: refit up-projection by least squares with fixed subspace projection')
@@ -991,7 +1254,7 @@ if __name__ == '__main__':
         model = model.eval()
         need_outlier_stats = args.stage1_outlier_ratio > 0 and args.stage1_outlier_criterion == "infinity_norm"
         cali_white_data = None
-        need_calibration_data = args.profiling_mat_path is None or args.enable_stage3 or args.enable_sam or need_outlier_stats
+        need_calibration_data = args.profiling_mat_path is None or args.enable_stage3 or args.enable_sam or args.enable_sg_cealc or need_outlier_stats
         if need_calibration_data:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
         outlier_channel_stats = None
@@ -1036,6 +1299,14 @@ if __name__ == '__main__':
             enable_stage3=args.enable_stage3,
             stage3_lambda=args.stage3_lambda,
             stage3_max_batches=args.stage3_max_batches,
+            enable_sg_cealc=args.enable_sg_cealc,
+            sg_cealc_beta=args.sg_cealc_beta,
+            sg_cealc_eta=args.sg_cealc_eta,
+            sg_cealc_max_batches=args.sg_cealc_max_batches,
+            sg_cealc_max_drift=args.sg_cealc_max_drift,
+            sg_cealc_max_cond=args.sg_cealc_max_cond,
+            sg_cealc_min_energy_ratio=args.sg_cealc_min_energy_ratio,
+            sg_cealc_max_energy_ratio=args.sg_cealc_max_energy_ratio,
             enable_ecsvr=args.enable_ecsvr,
             ecsvr_max_scale=args.ecsvr_max_scale,
             enable_sam=args.enable_sam,

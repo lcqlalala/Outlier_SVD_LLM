@@ -282,6 +282,98 @@ def _select_channel_partitions(scaling_diag_matrix, outlier_ratio, criterion="in
     return normal_indices, outlier_indices
 
 
+def _project_box_with_fixed_mean(values, lower, upper, target_mean, max_iter=80):
+    target_mean = float(target_mean)
+    lower = float(lower)
+    upper = float(upper)
+    if lower > upper:
+        lower, upper = upper, lower
+    target_mean = min(max(target_mean, lower), upper)
+
+    lo = -1e6
+    hi = 1e6
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        cur_mean = torch.clamp(values + mid, min=lower, max=upper).mean().item()
+        if cur_mean < target_mean:
+            lo = mid
+        else:
+            hi = mid
+    shift = 0.5 * (lo + hi)
+    return torch.clamp(values + shift, min=lower, max=upper)
+
+
+def _compute_laoa_layer_ratios(
+    outlier_channel_stats,
+    global_ratio,
+    min_ratio=0.005,
+    max_ratio=0.06,
+    temperature=None,
+    eps=1e-8,
+):
+    if outlier_channel_stats is None or global_ratio <= 0:
+        return None
+
+    if min_ratio > max_ratio:
+        min_ratio, max_ratio = max_ratio, min_ratio
+    if not (min_ratio <= global_ratio <= max_ratio):
+        print(
+            f"Warning: global Stage1 ratio={global_ratio:.6f} is outside "
+            f"[{min_ratio:.6f}, {max_ratio:.6f}], LAOA falls back to uniform ratio."
+        )
+        return {i: float(global_ratio) for i in outlier_channel_stats}
+
+    layer_ids = sorted(outlier_channel_stats.keys())
+    cv_list = []
+    valid_layer_ids = []
+    for i in layer_ids:
+        channel_values = []
+        for _, v in outlier_channel_stats[i].items():
+            if v is not None and v.numel() > 0:
+                channel_values.append(v.float().reshape(-1))
+        if len(channel_values) == 0:
+            continue
+        c = torch.cat(channel_values, dim=0)
+        mu = c.mean()
+        sigma = c.std(unbiased=False)
+        cv = sigma / (mu + eps)
+        cv_list.append(float(cv.item()))
+        valid_layer_ids.append(i)
+
+    if len(valid_layer_ids) == 0:
+        return None
+
+    cv_tensor = torch.tensor(cv_list, dtype=torch.float32)
+    if temperature is None or temperature <= 0:
+        temperature = float(torch.clamp(cv_tensor.mean(), min=1e-6).item())
+    logits = cv_tensor / max(float(temperature), 1e-6)
+    logits = logits - logits.max()
+    weight = torch.softmax(logits, dim=0)
+
+    raw_ratio = weight * (len(valid_layer_ids) * float(global_ratio))
+    clipped_ratio = torch.clamp(raw_ratio, min=min_ratio, max=max_ratio)
+    final_ratio = _project_box_with_fixed_mean(
+        clipped_ratio,
+        lower=min_ratio,
+        upper=max_ratio,
+        target_mean=float(global_ratio),
+    )
+
+    layer_ratio_map = {i: float(global_ratio) for i in layer_ids}
+    for idx, layer_id in enumerate(valid_layer_ids):
+        layer_ratio_map[layer_id] = float(final_ratio[idx].item())
+
+    ratio_tensor = torch.tensor([layer_ratio_map[i] for i in layer_ids], dtype=torch.float32)
+    print(
+        "LAOA layer ratio stats: "
+        f"mean={ratio_tensor.mean().item():.6f}, "
+        f"min={ratio_tensor.min().item():.6f}, "
+        f"max={ratio_tensor.max().item():.6f}, "
+        f"temperature={float(temperature):.6f}"
+    )
+    return layer_ratio_map
+
+
 def _get_parent_module(root_module, module_name):
     attrs = module_name.split(".")
     parent = root_module
@@ -557,6 +649,7 @@ def whitening(
     calib_loader=None,
     stage1_outlier_ratio=0.0,
     stage1_outlier_criterion="infinity_norm",
+    stage1_layer_ratio_map=None,
     outlier_channel_stats=None,
     enable_stage3=False,
     stage3_lambda=1.0,
@@ -584,12 +677,15 @@ def whitening(
             module = subset[name]
             W = module.weight.data.float().to(dev)
             scaling_diag_matrix = profiling_mat[i][name].to(dev).float()
+            layer_outlier_ratio = stage1_outlier_ratio
+            if stage1_layer_ratio_map is not None and i in stage1_layer_ratio_map:
+                layer_outlier_ratio = float(stage1_layer_ratio_map[i])
             channel_max_abs = None
             if outlier_channel_stats is not None and i in outlier_channel_stats and name in outlier_channel_stats[i]:
                 channel_max_abs = outlier_channel_stats[i][name]
             normal_idx, outlier_idx = _select_channel_partitions(
                 scaling_diag_matrix,
-                stage1_outlier_ratio,
+                layer_outlier_ratio,
                 criterion=stage1_outlier_criterion,
                 channel_max_abs=channel_max_abs,
             )
@@ -969,6 +1065,10 @@ if __name__ == '__main__':
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
     parser.add_argument('--stage1_outlier_ratio', type=float, default=0.0, help='Stage 1: fraction of input channels to strip as dense outliers')
     parser.add_argument('--stage1_outlier_criterion', type=str, default='infinity_norm', choices=['infinity_norm', 'energy'], help='Stage 1: outlier channel criterion')
+    parser.add_argument('--enable_laoa', action='store_true', help='Enable LAOA: layer-wise adaptive outlier allocation with infinity-norm CV')
+    parser.add_argument('--laoa_min_ratio', type=float, default=0.005, help='LAOA: minimum layer outlier ratio')
+    parser.add_argument('--laoa_max_ratio', type=float, default=0.06, help='LAOA: maximum layer outlier ratio')
+    parser.add_argument('--laoa_temperature', type=float, default=None, help='LAOA: softmax temperature; if not set, use mean(CV)')
     parser.add_argument('--enable_stage3', action='store_true', help='Stage 3: enable cross-sample stability selection')
     parser.add_argument('--stage3_lambda', type=float, default=1.0, help='Stage 3: variance penalty coefficient in stability score')
     parser.add_argument('--stage3_max_batches', type=int, default=None, help='Stage 3: optionally limit number of calibration batches for stability scoring')
@@ -1025,6 +1125,22 @@ if __name__ == '__main__':
                     _, outlier_channel_stats = profle_svdllm(
                         args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
                     )
+        stage1_layer_ratio_map = None
+        if args.enable_laoa:
+            if args.stage1_outlier_ratio <= 0:
+                print("Warning: LAOA is enabled but stage1_outlier_ratio <= 0. LAOA is ignored.")
+            elif args.stage1_outlier_criterion != "infinity_norm":
+                print("Warning: LAOA requires stage1_outlier_criterion=infinity_norm. LAOA is ignored.")
+            elif outlier_channel_stats is None:
+                print("Warning: LAOA needs channel max statistics, but none are available. LAOA is ignored.")
+            else:
+                stage1_layer_ratio_map = _compute_laoa_layer_ratios(
+                    outlier_channel_stats=outlier_channel_stats,
+                    global_ratio=args.stage1_outlier_ratio,
+                    min_ratio=args.laoa_min_ratio,
+                    max_ratio=args.laoa_max_ratio,
+                    temperature=args.laoa_temperature,
+                )
         whitening(
             args.model,
             model,
@@ -1034,6 +1150,7 @@ if __name__ == '__main__':
             calib_loader=cali_white_data,
             stage1_outlier_ratio=args.stage1_outlier_ratio,
             stage1_outlier_criterion=args.stage1_outlier_criterion,
+            stage1_layer_ratio_map=stage1_layer_ratio_map,
             outlier_channel_stats=outlier_channel_stats,
             enable_stage3=args.enable_stage3,
             stage3_lambda=args.stage3_lambda,

@@ -334,9 +334,9 @@ def _compute_laoa_layer_ratios(
         if len(channel_values) == 0:
             continue
         c = torch.cat(channel_values, dim=0)
-        # Use absolute outlier intensity instead of CV:
-        # layers with larger max-abs channels get more outlier budget.
-        intensity = c.mean()
+        # Absolute-Std scoring: emphasize absolute fluctuation energy
+        # without dividing by mean (unlike CV).
+        intensity = c.std(unbiased=False)
         score_list.append(float(intensity.item()))
         valid_layer_ids.append(i)
 

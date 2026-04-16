@@ -324,7 +324,7 @@ def _compute_laoa_layer_ratios(
         return {i: float(global_ratio) for i in outlier_channel_stats}
 
     layer_ids = sorted(outlier_channel_stats.keys())
-    cv_list = []
+    score_list = []
     valid_layer_ids = []
     for i in layer_ids:
         channel_values = []
@@ -334,19 +334,19 @@ def _compute_laoa_layer_ratios(
         if len(channel_values) == 0:
             continue
         c = torch.cat(channel_values, dim=0)
-        mu = c.mean()
-        sigma = c.std(unbiased=False)
-        cv = sigma / (mu + eps)
-        cv_list.append(float(cv.item()))
+        # Use absolute outlier intensity instead of CV:
+        # layers with larger max-abs channels get more outlier budget.
+        intensity = c.mean()
+        score_list.append(float(intensity.item()))
         valid_layer_ids.append(i)
 
     if len(valid_layer_ids) == 0:
         return None
 
-    cv_tensor = torch.tensor(cv_list, dtype=torch.float32)
+    score_tensor = torch.tensor(score_list, dtype=torch.float32)
     if temperature is None or temperature <= 0:
-        temperature = float(torch.clamp(cv_tensor.mean(), min=1e-6).item())
-    logits = cv_tensor / max(float(temperature), 1e-6)
+        temperature = float(torch.clamp(score_tensor.mean(), min=1e-6).item())
+    logits = score_tensor / max(float(temperature), 1e-6)
     logits = logits - logits.max()
     weight = torch.softmax(logits, dim=0)
 

@@ -391,6 +391,37 @@ def _iter_batches(calib_loader, max_batches=None):
 
 
 @torch.no_grad()
+def _layer_forward_pass(
+    model_name,
+    layer,
+    inps,
+    attention_masks,
+    position_ids,
+    dev,
+    outs=None,
+    max_batches=None,
+):
+    total = inps.shape[0]
+    if max_batches is not None:
+        total = min(total, int(max_batches))
+    for j in range(total):
+        if "opt" not in model_name:
+            out = layer(
+                inps[j].unsqueeze(0),
+                attention_mask=attention_masks[j].unsqueeze(0).to(dev),
+                position_ids=position_ids[j].unsqueeze(0).to(dev),
+            )[0]
+        else:
+            out = layer(
+                inps[j].unsqueeze(0),
+                attention_mask=attention_masks[j].unsqueeze(0).to(dev),
+            )[0]
+        if outs is not None:
+            outs[j] = out
+    return total
+
+
+@torch.no_grad()
 def _apply_sam(
     model_name,
     model,
@@ -545,6 +576,385 @@ def _apply_sam(
         )
 
     model = model.cpu()
+
+
+@torch.no_grad()
+def whitening_sequential(
+    model_name,
+    model,
+    ratio,
+    dev,
+    calib_loader,
+    stage1_outlier_ratio=0.0,
+    stage1_outlier_criterion="infinity_norm",
+    stage1_layer_ratio_map=None,
+    enable_stage3=False,
+    stage3_lambda=1.0,
+    stage3_max_batches=None,
+    enable_ecsvr=False,
+    ecsvr_max_scale=None,
+    enable_sam=False,
+    sam_damp=1e-4,
+    sam_max_batches=None,
+):
+    if calib_loader is None:
+        raise ValueError("CCSR requires calibration data. Please provide calib_loader.")
+
+    model.eval()
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    if "opt" in model_name:
+        layers = model.model.decoder.layers
+        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
+        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.to(dev)
+        model.model.decoder.embed_positions = model.model.decoder.embed_positions.to(dev)
+    else:
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+
+    layers[0] = layers[0].to(dev)
+
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros(
+        (len(calib_loader), model.seqlen, model.config.hidden_size),
+        dtype=dtype,
+        device=dev,
+    )
+    cache = {"i": 0, "attention_mask": None, "position_ids": None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, inp, **kwargs):
+            inps[cache["i"]] = inp.detach().to(dtype=dtype, device=dev)
+            cache["i"] += 1
+            if cache["attention_mask"] is None:
+                cache["attention_mask"] = kwargs["attention_mask"].detach().cpu()
+                if "opt" not in model_name:
+                    cache["position_ids"] = kwargs["position_ids"].detach().cpu()
+            else:
+                cache["attention_mask"] = torch.cat(
+                    (cache["attention_mask"], kwargs["attention_mask"].detach().cpu()),
+                    dim=0,
+                )
+                if "opt" not in model_name:
+                    cache["position_ids"] = torch.cat(
+                        (cache["position_ids"], kwargs["position_ids"].detach().cpu()),
+                        dim=0,
+                    )
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for batch in calib_loader:
+        try:
+            batch = {k: v.to(dev) for k, v in batch.items()}
+            model(**batch)
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+    layers[0] = layers[0].cpu()
+
+    if "opt" in model_name:
+        model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.cpu()
+        model.model.decoder.final_layer_norm = model.model.decoder.final_layer_norm.cpu()
+        model.model.decoder.embed_positions = model.model.decoder.embed_positions.cpu()
+    else:
+        model.model.embed_tokens = model.model.embed_tokens.cpu()
+        model.model.norm = model.model.norm.cpu()
+
+    torch.cuda.empty_cache()
+    outs = torch.zeros_like(inps)
+    attention_masks = cache["attention_mask"]
+    position_ids = cache["position_ids"] if "opt" not in model_name else None
+
+    decomposition_book = {}
+    ecsvr_scales = []
+
+    print("Start CCSR: compression-consistent sequential reprofiling...")
+    for i in tqdm(range(len(layers))):
+        layer = layers[i].to(dev)
+        subset = find_layers(layer)
+        layer_book = {}
+
+        # Stage 1/2 profiling under compressed-prefix inputs.
+        def _profile_hook(module, input, _output):
+            inp = input[0].detach().float()
+            if inp.dim() == 2:
+                inp = inp.unsqueeze(0)
+            adds_sum = torch.sum(torch.matmul(inp.transpose(1, 2), inp), dim=0)
+            if getattr(module, "raw_scaling_diag_matrix", None) is None:
+                module.raw_scaling_diag_matrix = adds_sum
+            else:
+                module.raw_scaling_diag_matrix += adds_sum
+            channel_max_abs = inp.abs().amax(dim=(0, 1))
+            module.channel_max_abs = torch.maximum(module.channel_max_abs, channel_max_abs)
+
+        profile_handles = []
+        for name in subset:
+            subset[name].raw_scaling_diag_matrix = None
+            subset[name].channel_max_abs = torch.zeros(
+                subset[name].in_features, device=dev, dtype=torch.float32
+            )
+            profile_handles.append(subset[name].register_forward_hook(_profile_hook))
+
+        _layer_forward_pass(
+            model_name=model_name,
+            layer=layer,
+            inps=inps,
+            attention_masks=attention_masks,
+            position_ids=position_ids,
+            dev=dev,
+            outs=None,
+            max_batches=None,
+        )
+
+        for h in profile_handles:
+            h.remove()
+
+        layer_outlier_ratio = stage1_outlier_ratio
+        if stage1_layer_ratio_map is not None and i in stage1_layer_ratio_map:
+            layer_outlier_ratio = float(stage1_layer_ratio_map[i])
+
+        # Stage 1 + Stage 2 decomposition for current layer only.
+        for name in subset:
+            module = subset[name]
+            W = module.weight.data.float().to(dev)
+            raw_scaling_diag_matrix = module.raw_scaling_diag_matrix.float()
+            scaling_diag_matrix = _safe_cholesky(raw_scaling_diag_matrix, dev)
+
+            normal_idx, outlier_idx = _select_channel_partitions(
+                scaling_diag_matrix,
+                layer_outlier_ratio,
+                criterion=stage1_outlier_criterion,
+                channel_max_abs=module.channel_max_abs,
+            )
+
+            if normal_idx.numel() == scaling_diag_matrix.shape[0]:
+                scaling_diag_matrix_normal = scaling_diag_matrix
+            else:
+                cov = torch.matmul(scaling_diag_matrix, scaling_diag_matrix.transpose(0, 1))
+                cov_normal = cov.index_select(0, normal_idx).index_select(1, normal_idx)
+                scaling_diag_matrix_normal = _safe_cholesky(cov_normal, dev)
+                cov = cov_normal = None
+                del cov, cov_normal
+
+            scaling_matrix_inv = _safe_inverse(scaling_diag_matrix_normal, dev).float()
+            W_normal = W.index_select(1, normal_idx)
+            W_scale = torch.matmul(W_normal, scaling_diag_matrix_normal)
+            U, singular_values, VT = torch.linalg.svd(W_scale, full_matrices=False)
+            right_proj = torch.matmul(VT, scaling_matrix_inv)
+            proj_matrix = singular_values.unsqueeze(1) * right_proj
+            target_rank = _target_rank(W_normal.shape[0], W_normal.shape[1], ratio, singular_values.numel())
+
+            if outlier_idx.numel() > 0:
+                outlier_weight = W.index_select(1, outlier_idx).cpu()
+            else:
+                outlier_weight = torch.zeros((W.shape[0], 0), dtype=W.dtype)
+
+            layer_book[name] = {
+                "U": U.cpu(),
+                "singular_values": singular_values.cpu(),
+                "right_proj": right_proj.cpu(),
+                "proj_matrix": proj_matrix.cpu(),
+                "normal_idx": normal_idx.cpu(),
+                "outlier_idx": outlier_idx.cpu(),
+                "outlier_weight": outlier_weight,
+                "target_rank": target_rank,
+                "in_features": module.in_features,
+                "out_features": module.out_features,
+                "has_bias": module.bias is not None,
+                "bias": module.bias.data.cpu() if module.bias is not None else None,
+                "selected_idx": torch.arange(target_rank, dtype=torch.long),
+            }
+
+            module.raw_scaling_diag_matrix = None
+            module.channel_max_abs = None
+            W = W_normal = W_scale = raw_scaling_diag_matrix = scaling_diag_matrix = None
+            scaling_diag_matrix_normal = scaling_matrix_inv = None
+            U = singular_values = VT = right_proj = proj_matrix = None
+            del W, W_normal, W_scale, raw_scaling_diag_matrix, scaling_diag_matrix, scaling_diag_matrix_normal, scaling_matrix_inv
+            del U, singular_values, VT, right_proj, proj_matrix
+            torch.cuda.empty_cache()
+
+        # Stage 3 stability selection under compressed-prefix inputs.
+        if enable_stage3:
+            stage3_runtime = {}
+            for name in subset:
+                info = layer_book[name]
+                if info["singular_values"].numel() == 0:
+                    info["selected_idx"] = torch.empty(0, dtype=torch.long)
+                    continue
+                stage3_runtime[name] = {
+                    "normal_idx": info["normal_idx"].to(dev),
+                    "proj_matrix": info["proj_matrix"].to(dev),
+                    "sum_energy": torch.zeros_like(info["singular_values"], device=dev),
+                    "sum_sq_energy": torch.zeros_like(info["singular_values"], device=dev),
+                    "total_seqs": 0,
+                }
+
+            def _make_stage3_hook(module_name):
+                def _hook(_module, input, _output):
+                    inp = input[0].detach().float()
+                    if inp.dim() == 2:
+                        inp = inp.unsqueeze(0)
+                    info = stage3_runtime[module_name]
+                    normal_idx = info["normal_idx"]
+                    if normal_idx.numel() != inp.shape[-1]:
+                        inp = inp.index_select(-1, normal_idx)
+
+                    response_tensor = torch.matmul(inp, info["proj_matrix"].transpose(0, 1))
+                    seq_energy = torch.sum(response_tensor * response_tensor, dim=1)
+                    info["sum_energy"] += seq_energy.sum(dim=0)
+                    info["sum_sq_energy"] += (seq_energy * seq_energy).sum(dim=0)
+                    info["total_seqs"] += seq_energy.shape[0]
+
+                return _hook
+
+            stage3_handles = []
+            for name in stage3_runtime:
+                stage3_handles.append(subset[name].register_forward_hook(_make_stage3_hook(name)))
+
+            _layer_forward_pass(
+                model_name=model_name,
+                layer=layer,
+                inps=inps,
+                attention_masks=attention_masks,
+                position_ids=position_ids,
+                dev=dev,
+                outs=None,
+                max_batches=stage3_max_batches,
+            )
+
+            for h in stage3_handles:
+                h.remove()
+
+            for name in stage3_runtime:
+                info = stage3_runtime[name]
+                total_seqs = info["total_seqs"]
+                if total_seqs <= 0:
+                    score = torch.full_like(info["sum_energy"], -1e10)
+                else:
+                    mean_energy = info["sum_energy"] / total_seqs
+                    var_energy = (info["sum_sq_energy"] / total_seqs) - mean_energy * mean_energy
+                    var_energy = torch.clamp(var_energy, min=0.0)
+                    score = mean_energy - stage3_lambda * torch.sqrt(var_energy)
+                target_rank = layer_book[name]["target_rank"]
+                target_rank = min(target_rank, score.numel())
+                selected_idx = torch.topk(score, k=target_rank, largest=True).indices
+                layer_book[name]["selected_idx"] = selected_idx.cpu()
+
+                info["normal_idx"] = info["proj_matrix"] = None
+                info["sum_energy"] = info["sum_sq_energy"] = None
+                torch.cuda.empty_cache()
+
+        # Reconstruct current layer immediately.
+        for name in subset:
+            module = subset[name]
+            info = layer_book[name]
+
+            selected_idx = info["selected_idx"]
+            if selected_idx.numel() == 0 and info["normal_idx"].numel() > 0:
+                selected_idx = torch.arange(min(1, info["singular_values"].numel()), dtype=torch.long)
+
+            U_sel = info["U"][:, selected_idx].float()
+            if enable_ecsvr:
+                S_sel, gamma = _energy_conserving_recalibrate(
+                    info["singular_values"],
+                    selected_idx,
+                    max_scale=ecsvr_max_scale,
+                )
+                ecsvr_scales.append(gamma)
+            else:
+                S_sel = info["singular_values"][selected_idx].float()
+
+            right_proj_sel = info["right_proj"][selected_idx, :].float()
+            sqrt_s = torch.sqrt(torch.clamp(S_sel, min=0))
+            svd_u = U_sel * sqrt_s.unsqueeze(0)
+            svd_v = right_proj_sel * sqrt_s.unsqueeze(1)
+
+            new_linear = StableSVDLinear(
+                in_features=info["in_features"],
+                out_features=info["out_features"],
+                rank=svd_v.shape[0],
+                normal_indices=info["normal_idx"],
+                outlier_indices=info["outlier_idx"],
+                bias=info["has_bias"],
+            ).to(dtype=module.weight.dtype, device=module.weight.device)
+
+            if new_linear.has_low_rank:
+                new_linear.u_proj.weight.data = svd_u.to(
+                    dtype=module.weight.dtype, device=new_linear.u_proj.weight.device
+                )
+                new_linear.v_proj.weight.data = svd_v.to(
+                    dtype=module.weight.dtype, device=new_linear.v_proj.weight.device
+                )
+                if info["has_bias"]:
+                    new_linear.u_proj.bias.data = info["bias"].to(
+                        dtype=module.weight.dtype, device=new_linear.u_proj.bias.device
+                    )
+            elif info["has_bias"] and getattr(new_linear, "bias", None) is not None:
+                new_linear.bias.data = info["bias"].to(
+                    dtype=module.weight.dtype, device=new_linear.bias.device
+                )
+
+            if new_linear.has_outlier:
+                new_linear.outlier_proj.weight.data = info["outlier_weight"].to(
+                    dtype=module.weight.dtype,
+                    device=new_linear.outlier_proj.weight.device,
+                )
+
+            parent_module, leaf_name = _get_parent_module(layer, name)
+            setattr(parent_module, leaf_name, new_linear)
+
+            U_sel = S_sel = right_proj_sel = sqrt_s = svd_u = svd_v = None
+            del U_sel, S_sel, right_proj_sel, sqrt_s, svd_u, svd_v
+            torch.cuda.empty_cache()
+
+        decomposition_book[i] = layer_book
+
+        # Propagate compressed outputs to next layer.
+        _layer_forward_pass(
+            model_name=model_name,
+            layer=layer,
+            inps=inps,
+            attention_masks=attention_masks,
+            position_ids=position_ids,
+            dev=dev,
+            outs=outs,
+            max_batches=None,
+        )
+
+        layers[i] = layer.cpu()
+        inps, outs = outs, inps
+        torch.cuda.empty_cache()
+
+    if enable_ecsvr and len(ecsvr_scales) > 0:
+        gamma_tensor = torch.tensor(ecsvr_scales, dtype=torch.float32)
+        print(
+            "EC-SVR scale stats: "
+            f"mean={gamma_tensor.mean().item():.4f}, "
+            f"min={gamma_tensor.min().item():.4f}, "
+            f"max={gamma_tensor.max().item():.4f}"
+        )
+
+    if enable_sam:
+        _apply_sam(
+            model_name=model_name,
+            model=model,
+            decomposition_book=decomposition_book,
+            calib_loader=calib_loader,
+            dev=dev,
+            sam_damp=sam_damp,
+            sam_max_batches=sam_max_batches,
+            enable_ecsvr=enable_ecsvr,
+            ecsvr_max_scale=ecsvr_max_scale,
+        )
+
+    model.config.use_cache = use_cache
 
 
 @torch.no_grad()
@@ -1051,6 +1461,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', type=str, default=None, help='local compressed model path or whitening information path')
     parser.add_argument('--ratio', type=float, default=0.2, help='Target compression ratio,(0,1), default=0.2, means only keeping about 20% of the params.')
     parser.add_argument('--run_low_resource', action='store_true', help='whether to run whitening in low resource, exp, compress LLaMA-7B below 15G gpu')
+    parser.add_argument('--enable_ccsr', action='store_true', help='Enable CCSR: compression-consistent sequential reprofiling')
     parser.add_argument('--dataset', type=str, default='wikitext2',help='Where to extract calibration data from [wikitext2, ptb, c4]')
     parser.add_argument('--whitening_nsamples', type=int, default=256, help='Number of calibration data samples for whitening.')
     parser.add_argument('--updating_nsamples', type=int, default=16, help='Number of calibration data samples for udpating.')
@@ -1065,7 +1476,7 @@ if __name__ == '__main__':
     parser.add_argument('--lora', type=str, default=None, help='the lora updated weight path to run the accuracy evaluation')
     parser.add_argument('--stage1_outlier_ratio', type=float, default=0.0, help='Stage 1: fraction of input channels to strip as dense outliers')
     parser.add_argument('--stage1_outlier_criterion', type=str, default='infinity_norm', choices=['infinity_norm', 'energy'], help='Stage 1: outlier channel criterion')
-    parser.add_argument('--enable_laoa', action='store_true', help='Enable LAOA: layer-wise adaptive outlier allocation with infinity-norm CV')
+    parser.add_argument('--enable_laoa', action='store_true', help='Enable LAOA: layer-wise adaptive outlier allocation')
     parser.add_argument('--laoa_min_ratio', type=float, default=0.005, help='LAOA: minimum layer outlier ratio')
     parser.add_argument('--laoa_max_ratio', type=float, default=0.06, help='LAOA: maximum layer outlier ratio')
     parser.add_argument('--laoa_temperature', type=float, default=None, help='LAOA: softmax temperature; if not set, use mean(CV)')
@@ -1091,76 +1502,133 @@ if __name__ == '__main__':
         else:
             model.seqlen = 2048
         model = model.eval()
-        need_outlier_stats = args.stage1_outlier_ratio > 0 and args.stage1_outlier_criterion == "infinity_norm"
+
+        if args.enable_ccsr and args.profiling_mat_path is not None:
+            print("Warning: CCSR ignores --profiling_mat_path and reprofiles each layer sequentially.")
+
         cali_white_data = None
-        need_calibration_data = args.profiling_mat_path is None or args.enable_stage3 or args.enable_sam or need_outlier_stats
+        need_calibration_data = (
+            args.enable_ccsr
+            or args.profiling_mat_path is None
+            or args.enable_stage3
+            or args.enable_sam
+            or args.enable_laoa
+            or (args.stage1_outlier_ratio > 0 and args.stage1_outlier_criterion == "infinity_norm")
+        )
         if need_calibration_data:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
-        outlier_channel_stats = None
-        if args.profiling_mat_path is None:
-            if args.run_low_resource:
-                if need_outlier_stats:
-                    profiling_mat, outlier_channel_stats = profle_svdllm_low_resource(
-                        args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
-                    )
-                else:
-                    profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
-            else:
-                if need_outlier_stats:
-                    profiling_mat, outlier_channel_stats = profle_svdllm(
-                        args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
-                    )
-                else:
-                    profiling_mat = profle_svdllm(args.model, model, cali_white_data, args.DEV)
-            if args.save_path is not None:
-                torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
-        else:
-            profiling_mat = torch.load(args.profiling_mat_path)
-            if need_outlier_stats:
-                if args.run_low_resource:
-                    _, outlier_channel_stats = profle_svdllm_low_resource(
-                        args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
-                    )
-                else:
-                    _, outlier_channel_stats = profle_svdllm(
-                        args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
-                    )
+
         stage1_layer_ratio_map = None
-        if args.enable_laoa:
-            if args.stage1_outlier_ratio <= 0:
-                print("Warning: LAOA is enabled but stage1_outlier_ratio <= 0. LAOA is ignored.")
-            elif args.stage1_outlier_criterion != "infinity_norm":
-                print("Warning: LAOA requires stage1_outlier_criterion=infinity_norm. LAOA is ignored.")
-            elif outlier_channel_stats is None:
-                print("Warning: LAOA needs channel max statistics, but none are available. LAOA is ignored.")
+        outlier_channel_stats = None
+
+        if args.enable_ccsr:
+            if args.enable_laoa:
+                if args.stage1_outlier_ratio <= 0:
+                    print("Warning: LAOA is enabled but stage1_outlier_ratio <= 0. LAOA is ignored.")
+                elif args.stage1_outlier_criterion != "infinity_norm":
+                    print("Warning: LAOA requires stage1_outlier_criterion=infinity_norm. LAOA is ignored.")
+                else:
+                    print("CCSR+LAOA: collecting one-shot channel max stats for layer-ratio allocation.")
+                    if args.run_low_resource:
+                        _, outlier_channel_stats = profle_svdllm_low_resource(
+                            args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
+                        )
+                    else:
+                        _, outlier_channel_stats = profle_svdllm(
+                            args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
+                        )
+                    stage1_layer_ratio_map = _compute_laoa_layer_ratios(
+                        outlier_channel_stats=outlier_channel_stats,
+                        global_ratio=args.stage1_outlier_ratio,
+                        min_ratio=args.laoa_min_ratio,
+                        max_ratio=args.laoa_max_ratio,
+                        temperature=args.laoa_temperature,
+                    )
+
+            whitening_sequential(
+                model_name=args.model,
+                model=model,
+                ratio=args.ratio,
+                dev=args.DEV,
+                calib_loader=cali_white_data,
+                stage1_outlier_ratio=args.stage1_outlier_ratio,
+                stage1_outlier_criterion=args.stage1_outlier_criterion,
+                stage1_layer_ratio_map=stage1_layer_ratio_map,
+                enable_stage3=args.enable_stage3,
+                stage3_lambda=args.stage3_lambda,
+                stage3_max_batches=args.stage3_max_batches,
+                enable_ecsvr=args.enable_ecsvr,
+                ecsvr_max_scale=args.ecsvr_max_scale,
+                enable_sam=args.enable_sam,
+                sam_damp=args.sam_damp,
+                sam_max_batches=args.sam_max_batches,
+            )
+        else:
+            need_outlier_stats = args.stage1_outlier_ratio > 0 and args.stage1_outlier_criterion == "infinity_norm"
+            if args.profiling_mat_path is None:
+                if args.run_low_resource:
+                    if need_outlier_stats:
+                        profiling_mat, outlier_channel_stats = profle_svdllm_low_resource(
+                            args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
+                        )
+                    else:
+                        profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
+                else:
+                    if need_outlier_stats:
+                        profiling_mat, outlier_channel_stats = profle_svdllm(
+                            args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
+                        )
+                    else:
+                        profiling_mat = profle_svdllm(args.model, model, cali_white_data, args.DEV)
+                if args.save_path is not None:
+                    torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
             else:
-                stage1_layer_ratio_map = _compute_laoa_layer_ratios(
-                    outlier_channel_stats=outlier_channel_stats,
-                    global_ratio=args.stage1_outlier_ratio,
-                    min_ratio=args.laoa_min_ratio,
-                    max_ratio=args.laoa_max_ratio,
-                    temperature=args.laoa_temperature,
-                )
-        whitening(
-            args.model,
-            model,
-            profiling_mat,
-            args.ratio,
-            args.DEV,
-            calib_loader=cali_white_data,
-            stage1_outlier_ratio=args.stage1_outlier_ratio,
-            stage1_outlier_criterion=args.stage1_outlier_criterion,
-            stage1_layer_ratio_map=stage1_layer_ratio_map,
-            outlier_channel_stats=outlier_channel_stats,
-            enable_stage3=args.enable_stage3,
-            stage3_lambda=args.stage3_lambda,
-            stage3_max_batches=args.stage3_max_batches,
-            enable_ecsvr=args.enable_ecsvr,
-            ecsvr_max_scale=args.ecsvr_max_scale,
-            enable_sam=args.enable_sam,
-            sam_damp=args.sam_damp,
-            sam_max_batches=args.sam_max_batches,
-        )
+                profiling_mat = torch.load(args.profiling_mat_path)
+                if need_outlier_stats:
+                    if args.run_low_resource:
+                        _, outlier_channel_stats = profle_svdllm_low_resource(
+                            args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
+                        )
+                    else:
+                        _, outlier_channel_stats = profle_svdllm(
+                            args.model, model, cali_white_data, args.DEV, return_outlier_stats=True
+                        )
+
+            if args.enable_laoa:
+                if args.stage1_outlier_ratio <= 0:
+                    print("Warning: LAOA is enabled but stage1_outlier_ratio <= 0. LAOA is ignored.")
+                elif args.stage1_outlier_criterion != "infinity_norm":
+                    print("Warning: LAOA requires stage1_outlier_criterion=infinity_norm. LAOA is ignored.")
+                elif outlier_channel_stats is None:
+                    print("Warning: LAOA needs channel max statistics, but none are available. LAOA is ignored.")
+                else:
+                    stage1_layer_ratio_map = _compute_laoa_layer_ratios(
+                        outlier_channel_stats=outlier_channel_stats,
+                        global_ratio=args.stage1_outlier_ratio,
+                        min_ratio=args.laoa_min_ratio,
+                        max_ratio=args.laoa_max_ratio,
+                        temperature=args.laoa_temperature,
+                    )
+            whitening(
+                args.model,
+                model,
+                profiling_mat,
+                args.ratio,
+                args.DEV,
+                calib_loader=cali_white_data,
+                stage1_outlier_ratio=args.stage1_outlier_ratio,
+                stage1_outlier_criterion=args.stage1_outlier_criterion,
+                stage1_layer_ratio_map=stage1_layer_ratio_map,
+                outlier_channel_stats=outlier_channel_stats,
+                enable_stage3=args.enable_stage3,
+                stage3_lambda=args.stage3_lambda,
+                stage3_max_batches=args.stage3_max_batches,
+                enable_ecsvr=args.enable_ecsvr,
+                ecsvr_max_scale=args.ecsvr_max_scale,
+                enable_sam=args.enable_sam,
+                sam_damp=args.sam_damp,
+                sam_max_batches=args.sam_max_batches,
+            )
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:

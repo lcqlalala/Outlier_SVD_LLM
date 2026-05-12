@@ -22,6 +22,16 @@ parent_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(current_path)
 
 
+def _move_llm_shared_modules(model_name, model, dev):
+    # Llama-3.x keeps RoPE (rotary_emb) as a model-level module.
+    # In low-resource/sequential flows we move only part of the model to GPU,
+    # so rotary_emb must follow the same device to avoid cpu/cuda mismatch.
+    if "opt" in model_name:
+        return
+    if hasattr(model, "model") and hasattr(model.model, "rotary_emb") and isinstance(model.model.rotary_emb, nn.Module):
+        model.model.rotary_emb = model.model.rotary_emb.to(dev)
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev, return_outlier_stats=False):
@@ -100,6 +110,8 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
+    _move_llm_shared_modules(model_name, model, dev)
+    _move_llm_shared_modules(model_name, model, dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -139,6 +151,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
     else:  
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
+    _move_llm_shared_modules(model_name, model, "cpu")
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
     attention_masks = cache['attention_mask']
@@ -665,6 +678,7 @@ def whitening_sequential(
     else:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
+    _move_llm_shared_modules(model_name, model, "cpu")
 
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
@@ -1254,6 +1268,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
+    _move_llm_shared_modules(model_name, model, dev)
     model.model.norm = model.model.norm.to(dev)
     layers[0] = layers[0].to(dev)
 
@@ -1288,6 +1303,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     model.model.norm = model.model.norm.cpu()
+    _move_llm_shared_modules(model_name, model, "cpu")
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
     attention_masks = cache['attention_mask']
@@ -1495,8 +1511,8 @@ if __name__ == '__main__':
         # model, tokenizer = get_model_from_huggingface(model_id=args.model)
         
         model_load_dtype = torch.float16
-        model = AutoModelForCausalLM.from_pretrained('/data1/common/llm-models/llama-7b', torch_dtype=model_load_dtype)
-        tokenizer = AutoTokenizer.from_pretrained('/data1/common/llm-models/llama-7b')
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_load_dtype)
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
         if hasattr(model.config, "max_position_embeddings"):
             model.seqlen = model.config.max_position_embeddings
         else:
@@ -1634,8 +1650,8 @@ if __name__ == '__main__':
     elif args.step == 2:
         # model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model_load_dtype = torch.float16
-        model = AutoModelForCausalLM.from_pretrained('/data1/common/llm-models/llama-7b', torch_dtype=model_load_dtype)
-        tokenizer = AutoTokenizer.from_pretrained('/data1/common/llm-models/llama-7b')
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_load_dtype)
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
         if hasattr(model.config, "max_position_embeddings"):
             model.seqlen = model.config.max_position_embeddings
         else:

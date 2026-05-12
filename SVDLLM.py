@@ -3,6 +3,7 @@ import os
 import sys
 import argparse
 import itertools
+import inspect
 import torch.jit
 from tqdm import tqdm
 import torch
@@ -260,19 +261,17 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
             subset[name].scaling_diag_matrix = 0
             subset[name].channel_max_abs = torch.zeros(subset[name].in_features, device=dev, dtype=torch.float32)
             handles.append(subset[name].register_forward_hook(hook))
-        for j in range(inps.shape[0]):
-            if "opt" not in model_name:
-                kwargs = {}
-                if attention_masks is not None:
-                    kwargs["attention_mask"] = attention_masks[j].unsqueeze(0).to(dev)
-                if position_ids is not None:
-                    kwargs["position_ids"] = position_ids[j].unsqueeze(0).to(dev)
-                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
-            else:
-                if attention_masks is not None:
-                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev))[0]
-                else:
-                    outs[j] = layer(inps[j].unsqueeze(0))[0]
+        _layer_forward_pass(
+            model=model,
+            model_name=model_name,
+            layer=layer,
+            inps=inps,
+            attention_masks=attention_masks,
+            position_ids=position_ids if "opt" not in model_name else None,
+            dev=dev,
+            outs=outs,
+            max_batches=None,
+        )
         for h in handles:
             h.remove()
         layer = layer.cpu()
@@ -491,8 +490,81 @@ def _iter_batches(calib_loader, max_batches=None):
     return itertools.islice(calib_loader, max_batches)
 
 
+def _build_decoder_layer_kwargs(
+    model_name,
+    model,
+    layer,
+    hidden_states,
+    attention_mask=None,
+    position_ids=None,
+):
+    if "opt" in model_name:
+        kwargs = {}
+        if attention_mask is not None:
+            kwargs["attention_mask"] = attention_mask
+        return kwargs
+
+    x = hidden_states
+    dev = x.device
+    seq_len = x.shape[1]
+
+    if position_ids is None:
+        position_ids = torch.arange(seq_len, device=dev, dtype=torch.long).unsqueeze(0)
+    else:
+        position_ids = position_ids.to(dev)
+        if position_ids.dim() == 1:
+            position_ids = position_ids.unsqueeze(0)
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(dev)
+
+    cache_position = position_ids[0]
+
+    # Reuse HF internal causal-mask builder when available.
+    if hasattr(model, "model") and hasattr(model.model, "_update_causal_mask"):
+        try:
+            attention_mask = model.model._update_causal_mask(
+                attention_mask,
+                x,
+                cache_position,
+                None,
+            )
+        except TypeError:
+            try:
+                attention_mask = model.model._update_causal_mask(
+                    attention_mask,
+                    x,
+                    cache_position,
+                    past_seen_tokens=0,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    position_embeddings = None
+    if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
+        try:
+            position_embeddings = model.model.rotary_emb(x, position_ids)
+        except Exception:
+            position_embeddings = None
+
+    sig = inspect.signature(layer.forward).parameters
+    kwargs = {}
+    if "attention_mask" in sig:
+        kwargs["attention_mask"] = attention_mask
+    if "position_ids" in sig:
+        kwargs["position_ids"] = position_ids
+    if "cache_position" in sig:
+        kwargs["cache_position"] = cache_position
+    if "position_embeddings" in sig and position_embeddings is not None:
+        kwargs["position_embeddings"] = position_embeddings
+    return kwargs
+
+
 @torch.no_grad()
 def _layer_forward_pass(
+    model,
     model_name,
     layer,
     inps,
@@ -507,12 +579,18 @@ def _layer_forward_pass(
         total = min(total, int(max_batches))
     for j in range(total):
         if "opt" not in model_name:
-            kwargs = {}
-            if attention_masks is not None:
-                kwargs["attention_mask"] = attention_masks[j].unsqueeze(0).to(dev)
-            if position_ids is not None:
-                kwargs["position_ids"] = position_ids[j].unsqueeze(0).to(dev)
-            out = layer(inps[j].unsqueeze(0), **kwargs)[0]
+            x = inps[j].unsqueeze(0)
+            mask_j = attention_masks[j].unsqueeze(0).to(dev) if attention_masks is not None else None
+            pos_j = position_ids[j].unsqueeze(0).to(dev) if position_ids is not None else None
+            kwargs = _build_decoder_layer_kwargs(
+                model_name=model_name,
+                model=model,
+                layer=layer,
+                hidden_states=x,
+                attention_mask=mask_j,
+                position_ids=pos_j,
+            )
+            out = layer(x, **kwargs)[0]
         else:
             if attention_masks is not None:
                 out = layer(
@@ -815,6 +893,7 @@ def whitening_sequential(
             profile_handles.append(subset[name].register_forward_hook(_profile_hook))
 
         _layer_forward_pass(
+            model=model,
             model_name=model_name,
             layer=layer,
             inps=inps,
@@ -932,6 +1011,7 @@ def whitening_sequential(
                 stage3_handles.append(subset[name].register_forward_hook(_make_stage3_hook(name)))
 
             _layer_forward_pass(
+                model=model,
                 model_name=model_name,
                 layer=layer,
                 inps=inps,
@@ -1031,6 +1111,7 @@ def whitening_sequential(
 
         # Propagate compressed outputs to next layer.
         _layer_forward_pass(
+            model=model,
             model_name=model_name,
             layer=layer,
             inps=inps,
@@ -1441,18 +1522,17 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         handles = []
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
-        if "opt" not in model_name:
-            kwargs = {}
-            if attention_masks is not None:
-                kwargs["attention_mask"] = attention_masks
-            if position_ids is not None:
-                kwargs["position_ids"] = position_ids
-            outs = layer(inps, **kwargs)[0]
-        else:
-            if attention_masks is not None:
-                outs = layer(inps, attention_mask=attention_masks)[0]
-            else:
-                outs = layer(inps)[0]
+        _layer_forward_pass(
+            model=model,
+            model_name=model_name,
+            layer=layer,
+            inps=inps,
+            attention_masks=attention_masks,
+            position_ids=position_ids if "opt" not in model_name else None,
+            dev=dev,
+            outs=outs,
+            max_batches=None,
+        )
         for h in handles:
             h.remove()
         for name in gpts:
@@ -1511,18 +1591,17 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                     svd_mlp.up_v_proj.weight.data = svd_v
                     layer.mlp = svd_mlp
         layer = layer.to(dev)
-        if "opt" not in model_name:
-            kwargs = {}
-            if attention_masks is not None:
-                kwargs["attention_mask"] = attention_masks
-            if position_ids is not None:
-                kwargs["position_ids"] = position_ids
-            outs = layer(inps, **kwargs)[0]
-        else:
-            if attention_masks is not None:
-                outs = layer(inps, attention_mask=attention_masks)[0]
-            else:
-                outs = layer(inps)[0]
+        _layer_forward_pass(
+            model=model,
+            model_name=model_name,
+            layer=layer,
+            inps=inps,
+            attention_masks=attention_masks,
+            position_ids=position_ids if "opt" not in model_name else None,
+            dev=dev,
+            outs=outs,
+            max_batches=None,
+        )
         layers[i] = layer.cpu()
         del gpts
         torch.cuda.empty_cache()

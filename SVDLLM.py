@@ -23,13 +23,36 @@ sys.path.append(current_path)
 
 
 def _move_llm_shared_modules(model_name, model, dev):
-    # Llama-3.x keeps RoPE (rotary_emb) as a model-level module.
-    # In low-resource/sequential flows we move only part of the model to GPU,
-    # so rotary_emb must follow the same device to avoid cpu/cuda mismatch.
+    # Llama-3.x keeps RoPE (rotary_emb) state at model level and may carry
+    # non-buffer tensor attrs (e.g., original_inv_freq) that .to(dev) won't move.
+    # In low-resource/sequential flows this can cause cpu/cuda mismatch.
     if "opt" in model_name:
         return
-    if hasattr(model, "model") and hasattr(model.model, "rotary_emb") and isinstance(model.model.rotary_emb, nn.Module):
-        model.model.rotary_emb = model.model.rotary_emb.to(dev)
+
+    def _move_rotary_module(m, device):
+        if not isinstance(m, nn.Module):
+            return
+        m.to(device)
+        # Move plain tensor attrs that are not registered buffers/parameters.
+        param_names = set(getattr(m, "_parameters", {}).keys())
+        buffer_names = set(getattr(m, "_buffers", {}).keys())
+        for k, v in vars(m).items():
+            if k in param_names or k in buffer_names:
+                continue
+            if torch.is_tensor(v):
+                try:
+                    setattr(m, k, v.to(device))
+                except Exception:
+                    pass
+
+    if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
+        _move_rotary_module(model.model.rotary_emb, dev)
+
+    # Compatibility fallback for implementations that keep per-layer rotary modules.
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer in model.model.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb"):
+                _move_rotary_module(layer.self_attn.rotary_emb, dev)
 
 
 

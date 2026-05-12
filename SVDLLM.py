@@ -200,14 +200,18 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp.cpu()
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask'].cpu()
-                if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids'].cpu()
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask'].cpu()), dim=0)
-                if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids'].cpu()), dim=0)
+            attention_mask = kwargs.get("attention_mask", None)
+            position_ids = kwargs.get("position_ids", None)
+            if attention_mask is not None:
+                if cache['attention_mask'] is None:
+                    cache['attention_mask'] = attention_mask.cpu()
+                else:
+                    cache['attention_mask'] = torch.cat((cache['attention_mask'], attention_mask.cpu()), dim=0)
+            if "opt" not in model_name and position_ids is not None:
+                if cache['position_ids'] is None:
+                    cache['position_ids'] = position_ids.cpu()
+                else:
+                    cache['position_ids'] = torch.cat((cache['position_ids'], position_ids.cpu()), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in calib_loader:
@@ -258,9 +262,17 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
             handles.append(subset[name].register_forward_hook(hook))
         for j in range(inps.shape[0]):
             if "opt" not in model_name:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev), position_ids=position_ids[j].unsqueeze(0).to(dev))[0]
+                kwargs = {}
+                if attention_masks is not None:
+                    kwargs["attention_mask"] = attention_masks[j].unsqueeze(0).to(dev)
+                if position_ids is not None:
+                    kwargs["position_ids"] = position_ids[j].unsqueeze(0).to(dev)
+                outs[j] = layer(inps[j].unsqueeze(0), **kwargs)[0]
             else:
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev))[0]
+                if attention_masks is not None:
+                    outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_masks[j].unsqueeze(0).to(dev))[0]
+                else:
+                    outs[j] = layer(inps[j].unsqueeze(0))[0]
         for h in handles:
             h.remove()
         layer = layer.cpu()
@@ -495,16 +507,20 @@ def _layer_forward_pass(
         total = min(total, int(max_batches))
     for j in range(total):
         if "opt" not in model_name:
-            out = layer(
-                inps[j].unsqueeze(0),
-                attention_mask=attention_masks[j].unsqueeze(0).to(dev),
-                position_ids=position_ids[j].unsqueeze(0).to(dev),
-            )[0]
+            kwargs = {}
+            if attention_masks is not None:
+                kwargs["attention_mask"] = attention_masks[j].unsqueeze(0).to(dev)
+            if position_ids is not None:
+                kwargs["position_ids"] = position_ids[j].unsqueeze(0).to(dev)
+            out = layer(inps[j].unsqueeze(0), **kwargs)[0]
         else:
-            out = layer(
-                inps[j].unsqueeze(0),
-                attention_mask=attention_masks[j].unsqueeze(0).to(dev),
-            )[0]
+            if attention_masks is not None:
+                out = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attention_masks[j].unsqueeze(0).to(dev),
+                )[0]
+            else:
+                out = layer(inps[j].unsqueeze(0))[0]
         if outs is not None:
             outs[j] = out
     return total
@@ -722,18 +738,22 @@ def whitening_sequential(
         def forward(self, inp, **kwargs):
             inps[cache["i"]] = inp.detach().to(dtype=dtype, device=dev)
             cache["i"] += 1
-            if cache["attention_mask"] is None:
-                cache["attention_mask"] = kwargs["attention_mask"].detach().cpu()
-                if "opt" not in model_name:
-                    cache["position_ids"] = kwargs["position_ids"].detach().cpu()
-            else:
-                cache["attention_mask"] = torch.cat(
-                    (cache["attention_mask"], kwargs["attention_mask"].detach().cpu()),
-                    dim=0,
-                )
-                if "opt" not in model_name:
+            attention_mask = kwargs.get("attention_mask", None)
+            position_ids = kwargs.get("position_ids", None)
+            if attention_mask is not None:
+                if cache["attention_mask"] is None:
+                    cache["attention_mask"] = attention_mask.detach().cpu()
+                else:
+                    cache["attention_mask"] = torch.cat(
+                        (cache["attention_mask"], attention_mask.detach().cpu()),
+                        dim=0,
+                    )
+            if "opt" not in model_name and position_ids is not None:
+                if cache["position_ids"] is None:
+                    cache["position_ids"] = position_ids.detach().cpu()
+                else:
                     cache["position_ids"] = torch.cat(
-                        (cache["position_ids"], kwargs["position_ids"].detach().cpu()),
+                        (cache["position_ids"], position_ids.detach().cpu()),
                         dim=0,
                     )
             raise ValueError
@@ -1364,14 +1384,18 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            if cache['attention_mask'] is None:
-                cache['attention_mask'] = kwargs['attention_mask']
-                if "opt" not in model_name:
-                    cache['position_ids'] = kwargs['position_ids']
-            else:
-                cache['attention_mask'] = torch.cat((cache['attention_mask'], kwargs['attention_mask']), dim=0)
-                if "opt" not in model_name:
-                    cache['position_ids'] = torch.cat((cache['position_ids'], kwargs['position_ids']), dim=0)
+            attention_mask = kwargs.get("attention_mask", None)
+            position_ids = kwargs.get("position_ids", None)
+            if attention_mask is not None:
+                if cache['attention_mask'] is None:
+                    cache['attention_mask'] = attention_mask
+                else:
+                    cache['attention_mask'] = torch.cat((cache['attention_mask'], attention_mask), dim=0)
+            if "opt" not in model_name and position_ids is not None:
+                if cache['position_ids'] is None:
+                    cache['position_ids'] = position_ids
+                else:
+                    cache['position_ids'] = torch.cat((cache['position_ids'], position_ids), dim=0)
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -1418,9 +1442,17 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         for name in gpts:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
         if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
+            kwargs = {}
+            if attention_masks is not None:
+                kwargs["attention_mask"] = attention_masks
+            if position_ids is not None:
+                kwargs["position_ids"] = position_ids
+            outs = layer(inps, **kwargs)[0]
         else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+            if attention_masks is not None:
+                outs = layer(inps, attention_mask=attention_masks)[0]
+            else:
+                outs = layer(inps)[0]
         for h in handles:
             h.remove()
         for name in gpts:
@@ -1480,9 +1512,17 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                     layer.mlp = svd_mlp
         layer = layer.to(dev)
         if "opt" not in model_name:
-            outs = layer(inps, attention_mask=attention_masks, position_ids=position_ids)[0]
+            kwargs = {}
+            if attention_masks is not None:
+                kwargs["attention_mask"] = attention_masks
+            if position_ids is not None:
+                kwargs["position_ids"] = position_ids
+            outs = layer(inps, **kwargs)[0]
         else:
-            outs = layer(inps, attention_mask=attention_masks)[0]
+            if attention_masks is not None:
+                outs = layer(inps, attention_mask=attention_masks)[0]
+            else:
+                outs = layer(inps)[0]
         layers[i] = layer.cpu()
         del gpts
         torch.cuda.empty_cache()

@@ -55,6 +55,56 @@ def _move_llm_shared_modules(model_name, model, dev):
                 _move_rotary_module(layer.self_attn.rotary_emb, dev)
 
 
+def _register_rotary_runtime_device_guard(model_name, model):
+    # Guard RoPE modules right before forward runs, so any lazily-updated
+    # tensor state is always on the same device as runtime inputs.
+    if "opt" in model_name:
+        return []
+
+    def _first_tensor_device(x):
+        if torch.is_tensor(x):
+            return x.device
+        if isinstance(x, (list, tuple)):
+            for y in x:
+                d = _first_tensor_device(y)
+                if d is not None:
+                    return d
+        if isinstance(x, dict):
+            for y in x.values():
+                d = _first_tensor_device(y)
+                if d is not None:
+                    return d
+        return None
+
+    def _sync_module_state(module, device):
+        module.to(device)
+        param_names = set(getattr(module, "_parameters", {}).keys())
+        buffer_names = set(getattr(module, "_buffers", {}).keys())
+        for k, v in vars(module).items():
+            if k in param_names or k in buffer_names:
+                continue
+            if torch.is_tensor(v):
+                try:
+                    setattr(module, k, v.to(device))
+                except Exception:
+                    pass
+
+    def _pre_hook(module, args):
+        device = _first_tensor_device(args)
+        if device is None:
+            return
+        _sync_module_state(module, device)
+
+    handles = []
+    if hasattr(model, "model") and hasattr(model.model, "rotary_emb") and isinstance(model.model.rotary_emb, nn.Module):
+        handles.append(model.model.rotary_emb.register_forward_pre_hook(_pre_hook))
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer in model.model.layers:
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "rotary_emb") and isinstance(layer.self_attn.rotary_emb, nn.Module):
+                handles.append(layer.self_attn.rotary_emb.register_forward_pre_hook(_pre_hook))
+    return handles
+
+
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev, return_outlier_stats=False):
@@ -142,6 +192,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
         (len(calib_loader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    rotary_guard_handles = _register_rotary_runtime_device_guard(model_name, model)
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -165,6 +216,8 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
             model(**batch)
         except ValueError:
             pass
+    for h in rotary_guard_handles:
+        h.remove()
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
     if "opt" in model_name:
@@ -659,6 +712,7 @@ def whitening_sequential(
         device=dev,
     )
     cache = {"i": 0, "attention_mask": None, "position_ids": None}
+    rotary_guard_handles = _register_rotary_runtime_device_guard(model_name, model)
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -691,6 +745,8 @@ def whitening_sequential(
             model(**batch)
         except ValueError:
             pass
+    for h in rotary_guard_handles:
+        h.remove()
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
 
@@ -1300,6 +1356,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         (len(dataloader), model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
     )
     cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    rotary_guard_handles = _register_rotary_runtime_device_guard(model_name, model)
     class Catcher(nn.Module):
         def __init__(self, module):
             super().__init__()
@@ -1322,6 +1379,8 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
             model(batch[0].to(dev))
         except ValueError:
             pass
+    for h in rotary_guard_handles:
+        h.remove()
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()

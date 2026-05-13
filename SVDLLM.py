@@ -185,7 +185,6 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
     _move_llm_shared_modules(model_name, model, dev)
-    _move_llm_shared_modules(model_name, model, dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -203,6 +202,9 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
             cache['i'] += 1
             attention_mask = kwargs.get("attention_mask", None)
             position_ids = kwargs.get("position_ids", None)
+            cache_position = kwargs.get("cache_position", None)
+            if position_ids is None and cache_position is not None:
+                position_ids = cache_position.unsqueeze(0)
             if attention_mask is not None:
                 if cache['attention_mask'] is None:
                     cache['attention_mask'] = attention_mask.cpu()
@@ -490,6 +492,41 @@ def _iter_batches(calib_loader, max_batches=None):
     return itertools.islice(calib_loader, max_batches)
 
 
+def _hf_update_causal_mask(model, attention_mask, input_tensor, cache_position):
+    if not (hasattr(model, "model") and hasattr(model.model, "_update_causal_mask")):
+        return attention_mask
+    fn = model.model._update_causal_mask
+    try:
+        sig = inspect.signature(fn).parameters
+        kwargs = {}
+        if "attention_mask" in sig:
+            kwargs["attention_mask"] = attention_mask
+        if "input_tensor" in sig:
+            kwargs["input_tensor"] = input_tensor
+        elif "hidden_states" in sig:
+            kwargs["hidden_states"] = input_tensor
+        if "cache_position" in sig:
+            kwargs["cache_position"] = cache_position
+        if "past_key_values" in sig:
+            kwargs["past_key_values"] = None
+        if "past_seen_tokens" in sig:
+            kwargs["past_seen_tokens"] = 0
+        if "use_cache" in sig:
+            kwargs["use_cache"] = False
+        if "output_attentions" in sig:
+            kwargs["output_attentions"] = False
+        return fn(**kwargs)
+    except Exception:
+        # Backward-compatible fallback for older signatures.
+        try:
+            return fn(attention_mask, input_tensor, cache_position, None)
+        except Exception:
+            try:
+                return fn(attention_mask, input_tensor, cache_position, past_seen_tokens=0)
+            except Exception:
+                return attention_mask
+
+
 def _build_decoder_layer_kwargs(
     model_name,
     model,
@@ -520,27 +557,18 @@ def _build_decoder_layer_kwargs(
 
     cache_position = position_ids[0]
 
-    # Reuse HF internal causal-mask builder when available.
-    if hasattr(model, "model") and hasattr(model.model, "_update_causal_mask"):
-        try:
-            attention_mask = model.model._update_causal_mask(
-                attention_mask,
-                x,
-                cache_position,
-                None,
-            )
-        except TypeError:
-            try:
-                attention_mask = model.model._update_causal_mask(
-                    attention_mask,
-                    x,
-                    cache_position,
-                    past_seen_tokens=0,
-                )
-            except Exception:
-                pass
-        except Exception:
-            pass
+    # Reuse HF internal causal-mask builder for missing/2D masks.
+    need_update_causal_mask = (
+        attention_mask is None
+        or (torch.is_tensor(attention_mask) and attention_mask.dim() <= 2)
+    )
+    if need_update_causal_mask:
+        attention_mask = _hf_update_causal_mask(
+            model=model,
+            attention_mask=attention_mask,
+            input_tensor=x,
+            cache_position=cache_position,
+        )
 
     position_embeddings = None
     if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
@@ -555,6 +583,10 @@ def _build_decoder_layer_kwargs(
         kwargs["attention_mask"] = attention_mask
     if "position_ids" in sig:
         kwargs["position_ids"] = position_ids
+    if "output_attentions" in sig:
+        kwargs["output_attentions"] = False
+    if "use_cache" in sig:
+        kwargs["use_cache"] = False
     if "cache_position" in sig:
         kwargs["cache_position"] = cache_position
     if "position_embeddings" in sig and position_embeddings is not None:
@@ -796,6 +828,7 @@ def whitening_sequential(
         layers = model.model.layers
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
+    _move_llm_shared_modules(model_name, model, dev)
 
     layers[0] = layers[0].to(dev)
 
@@ -818,6 +851,9 @@ def whitening_sequential(
             cache["i"] += 1
             attention_mask = kwargs.get("attention_mask", None)
             position_ids = kwargs.get("position_ids", None)
+            cache_position = kwargs.get("cache_position", None)
+            if position_ids is None and cache_position is not None:
+                position_ids = cache_position.unsqueeze(0)
             if attention_mask is not None:
                 if cache["attention_mask"] is None:
                     cache["attention_mask"] = attention_mask.detach().cpu()
@@ -1467,6 +1503,9 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
             cache['i'] += 1
             attention_mask = kwargs.get("attention_mask", None)
             position_ids = kwargs.get("position_ids", None)
+            cache_position = kwargs.get("cache_position", None)
+            if position_ids is None and cache_position is not None:
+                position_ids = cache_position.unsqueeze(0)
             if attention_mask is not None:
                 if cache['attention_mask'] is None:
                     cache['attention_mask'] = attention_mask

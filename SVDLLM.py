@@ -1041,7 +1041,7 @@ def whitening_sequential(
         # Stage 1 + Stage 2 decomposition for current layer only.
         for name in subset:
             module = subset[name]
-            W = module.weight.data.float().to(dev)
+            W = module.weight.data.to(dev)
             raw_scaling_diag_matrix = module.raw_scaling_diag_matrix
             scaling_diag_matrix = _safe_cholesky(raw_scaling_diag_matrix, dev)
 
@@ -1061,8 +1061,9 @@ def whitening_sequential(
                 cov = cov_normal = None
                 del cov, cov_normal
 
-            scaling_matrix_inv = _safe_inverse(scaling_diag_matrix_normal, dev).float()
-            W_normal = W.index_select(1, normal_idx)
+            compute_dtype = scaling_diag_matrix_normal.dtype
+            W_normal = W.index_select(1, normal_idx).to(dtype=compute_dtype)
+            scaling_matrix_inv = _safe_inverse(scaling_diag_matrix_normal, dev)
             W_scale = torch.matmul(W_normal, scaling_diag_matrix_normal)
             U, singular_values, VT = torch.linalg.svd(W_scale, full_matrices=False)
             right_proj = torch.matmul(VT, scaling_matrix_inv)
@@ -1124,6 +1125,7 @@ def whitening_sequential(
                     normal_idx = info["normal_idx"]
                     if normal_idx.numel() != inp.shape[-1]:
                         inp = inp.index_select(-1, normal_idx)
+                    inp = inp.to(dtype=info["proj_matrix"].dtype)
 
                     response_tensor = torch.matmul(inp, info["proj_matrix"].transpose(0, 1))
                     seq_energy = torch.sum(response_tensor * response_tensor, dim=1)
@@ -1325,6 +1327,7 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
                 normal_idx = info["normal_idx"]
                 if normal_idx.numel() != inp.shape[-1]:
                     inp = inp.index_select(-1, normal_idx)
+                inp = inp.to(dtype=info["proj_matrix"].dtype)
 
                 # R_tensor: [batch, seq_len, rank]
                 response_tensor = torch.matmul(inp, info["proj_matrix"].transpose(0, 1))
@@ -1406,7 +1409,7 @@ def whitening(
         layer_book = {}
         for name in subset:
             module = subset[name]
-            W = module.weight.data.float().to(dev)
+            W = module.weight.data.to(dev)
             scaling_diag_matrix = profiling_mat[i][name].to(dev)
             layer_outlier_ratio = stage1_outlier_ratio
             if stage1_layer_ratio_map is not None and i in stage1_layer_ratio_map:
@@ -1430,8 +1433,9 @@ def whitening(
                 cov = cov_normal = None
                 del cov, cov_normal
 
-            scaling_matrix_inv = _safe_inverse(scaling_diag_matrix_normal, dev).float()
-            W_normal = W.index_select(1, normal_idx)
+            compute_dtype = scaling_diag_matrix_normal.dtype
+            W_normal = W.index_select(1, normal_idx).to(dtype=compute_dtype)
+            scaling_matrix_inv = _safe_inverse(scaling_diag_matrix_normal, dev)
             W_scale = torch.matmul(W_normal, scaling_diag_matrix_normal)
             U, singular_values, VT = torch.linalg.svd(W_scale, full_matrices=False)
             right_proj = torch.matmul(VT, scaling_matrix_inv)

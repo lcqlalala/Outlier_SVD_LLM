@@ -308,15 +308,33 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
      
  
 def _safe_cholesky(raw_scaling_diag_matrix, dev):
-    raw_scaling_diag_matrix = raw_scaling_diag_matrix.float()
-    try:
-        return torch.linalg.cholesky(raw_scaling_diag_matrix)
-    except Exception:
-        print("Warning: scaling_diag_matrix is not positive definite, adding jitter.")
-        eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
-        jitter = (-eigenvalues[0] + 1e-6).item()
-        raw_scaling_diag_matrix = raw_scaling_diag_matrix + jitter * torch.eye(raw_scaling_diag_matrix.shape[0], device=dev)
-        return torch.linalg.cholesky(raw_scaling_diag_matrix)
+    # Numerical-stable Cholesky for large covariance matrices.
+    # This does not change algorithmic logic; it only hardens decomposition.
+    mat = raw_scaling_diag_matrix.float()
+    mat = 0.5 * (mat + mat.transpose(0, 1))
+
+    n = mat.shape[0]
+    eye = torch.eye(n, device=dev, dtype=mat.dtype)
+    diag_mean = torch.clamp(torch.mean(torch.abs(torch.diagonal(mat))), min=1.0)
+    base_jitter = float((diag_mean * 1e-6).item())
+
+    jitter = base_jitter
+    for _ in range(8):
+        chol, info = torch.linalg.cholesky_ex(mat + jitter * eye)
+        if int(info.max().item()) == 0:
+            return chol
+        jitter *= 10.0
+
+    print("Warning: scaling_diag_matrix is not positive definite, fallback to eigenvalue-based jitter.")
+    eigenvalues = torch.linalg.eigvalsh(mat)
+    min_eig = float(eigenvalues.min().item())
+    jitter = max(jitter, -min_eig + base_jitter)
+    chol, info = torch.linalg.cholesky_ex(mat + jitter * eye)
+    if int(info.max().item()) != 0:
+        # Last resort: increase jitter aggressively.
+        jitter = max(jitter * 10.0, 1e-2)
+        chol = torch.linalg.cholesky(mat + jitter * eye)
+    return chol
 
 
 def _safe_inverse(scaling_diag_matrix, dev):
@@ -490,6 +508,15 @@ def _iter_batches(calib_loader, max_batches=None):
     if isinstance(calib_loader, list):
         return calib_loader[:max_batches]
     return itertools.islice(calib_loader, max_batches)
+
+
+def _select_model_load_dtype(model_name_or_path):
+    name = str(model_name_or_path).lower()
+    # Keep existing behavior for LLaMA-1/2 and others.
+    # LLaMA-3.x official checkpoints are BF16-first.
+    if ("llama-3" in name or "llama3" in name) and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
 
 
 def _hf_update_causal_mask(model, attention_mask, input_tensor, cache_position):
@@ -1750,7 +1777,8 @@ if __name__ == '__main__':
     if args.step == 1:
         # model, tokenizer = get_model_from_huggingface(model_id=args.model)
         
-        model_load_dtype = torch.float16
+        model_load_dtype = _select_model_load_dtype(args.model)
+        print(f"Model load dtype: {model_load_dtype}")
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_load_dtype)
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         if hasattr(model.config, "max_position_embeddings"):
@@ -1889,7 +1917,8 @@ if __name__ == '__main__':
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
         # model, tokenizer = get_model_from_huggingface(model_id=args.model)
-        model_load_dtype = torch.float16
+        model_load_dtype = _select_model_load_dtype(args.model)
+        print(f"Model load dtype: {model_load_dtype}")
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_load_dtype)
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         if hasattr(model.config, "max_position_embeddings"):

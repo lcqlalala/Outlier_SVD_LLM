@@ -238,7 +238,6 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
     else:  
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
-    _move_llm_shared_modules(model_name, model, "cpu")
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
     attention_masks = cache['attention_mask']
@@ -308,6 +307,7 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
         outlier_stats[i] = layer_outlier
         inps = outs
         torch.cuda.empty_cache()
+    _move_llm_shared_modules(model_name, model, "cpu")
     if return_outlier_stats:
         return profiling_mat, outlier_stats
     return profiling_mat
@@ -357,6 +357,29 @@ def _safe_inverse(scaling_diag_matrix, dev):
             dtype=scaling_diag_matrix.dtype,
         )
         return torch.linalg.inv(scaling_diag_matrix)
+
+
+def _safe_svd(matrix, name=""):
+    try:
+        return torch.linalg.svd(matrix, full_matrices=False)
+    except Exception:
+        if matrix.is_cuda:
+            try:
+                print(f"Warning: SVD failed to converge on {name}, falling back to gesvd driver.")
+                return torch.linalg.svd(matrix, full_matrices=False, driver="gesvd")
+            except Exception:
+                pass
+        # Last resort fallback: CPU double SVD, then cast back.
+        print(f"Warning: SVD fallback to CPU on {name}.")
+        cpu_matrix = matrix.detach().to(device="cpu", dtype=torch.float64)
+        U, singular_values, VT = torch.linalg.svd(cpu_matrix, full_matrices=False)
+        out_dtype = matrix.dtype
+        out_dev = matrix.device
+        return (
+            U.to(device=out_dev, dtype=out_dtype),
+            singular_values.to(device=out_dev, dtype=out_dtype),
+            VT.to(device=out_dev, dtype=out_dtype),
+        )
 
 
 def _target_rank(rows, cols, ratio, max_rank):
@@ -636,10 +659,9 @@ def _build_decoder_layer_kwargs(
         if attention_mask is None:
             attention_mask = causal_4d
         elif torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
-            # Fuse 2D padding mask into additive 4D causal mask.
-            pad_mask = attention_mask.to(device=dev, dtype=x.dtype)
-            pad_bias = (1.0 - pad_mask[:, None, None, :]) * min_val
-            attention_mask = causal_4d + pad_bias
+            # Avoid min_val + min_val overflow in fp16/bf16 by masked_fill.
+            pad_mask = attention_mask.to(device=dev, dtype=torch.bool)
+            attention_mask = causal_4d.masked_fill(~pad_mask[:, None, None, :], min_val)
         elif torch.is_tensor(attention_mask) and attention_mask.dim() == 3:
             attention_mask = attention_mask.to(device=dev, dtype=x.dtype).unsqueeze(1)
         elif torch.is_tensor(attention_mask) and attention_mask.dim() == 4:
@@ -980,7 +1002,6 @@ def whitening_sequential(
     else:
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
-    _move_llm_shared_modules(model_name, model, "cpu")
 
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
@@ -1065,7 +1086,7 @@ def whitening_sequential(
             W_normal = W.index_select(1, normal_idx).to(dtype=compute_dtype)
             scaling_matrix_inv = _safe_inverse(scaling_diag_matrix_normal, dev)
             W_scale = torch.matmul(W_normal, scaling_diag_matrix_normal)
-            U, singular_values, VT = torch.linalg.svd(W_scale, full_matrices=False)
+            U, singular_values, VT = _safe_svd(W_scale, name=f"{i}:{name}")
             right_proj = torch.matmul(VT, scaling_matrix_inv)
             proj_matrix = singular_values.unsqueeze(1) * right_proj
             target_rank = _target_rank(W_normal.shape[0], W_normal.shape[1], ratio, singular_values.numel())
@@ -1277,6 +1298,7 @@ def whitening_sequential(
             ecsvr_max_scale=ecsvr_max_scale,
         )
 
+    _move_llm_shared_modules(model_name, model, "cpu")
     model.config.use_cache = use_cache
 
 
@@ -1437,7 +1459,7 @@ def whitening(
             W_normal = W.index_select(1, normal_idx).to(dtype=compute_dtype)
             scaling_matrix_inv = _safe_inverse(scaling_diag_matrix_normal, dev)
             W_scale = torch.matmul(W_normal, scaling_diag_matrix_normal)
-            U, singular_values, VT = torch.linalg.svd(W_scale, full_matrices=False)
+            U, singular_values, VT = _safe_svd(W_scale, name=f"{i}:{name}")
             right_proj = torch.matmul(VT, scaling_matrix_inv)
             proj_matrix = singular_values.unsqueeze(1) * right_proj
             target_rank = _target_rank(W_normal.shape[0], W_normal.shape[1], ratio, singular_values.numel())
@@ -1625,7 +1647,6 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
     layers[0] = layers[0].cpu()
     model.model.embed_tokens = model.model.embed_tokens.cpu()
     model.model.norm = model.model.norm.cpu()
-    _move_llm_shared_modules(model_name, model, "cpu")
     torch.cuda.empty_cache()
     outs = torch.zeros_like(inps)
     attention_masks = cache['attention_mask']
@@ -1743,6 +1764,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         inps = outs
         outs = None
         del outs
+    _move_llm_shared_modules(model_name, model, "cpu")
     model.config.use_cache = use_cache
 
 
@@ -1756,7 +1778,7 @@ class local_update:
         self.rows = W.shape[0]
         self.columns = W.shape[1]
         if direct_update:
-            self.U, self.S, self.VT = torch.linalg.svd(W.data, full_matrices=False)
+            self.U, self.S, self.VT = _safe_svd(W.data, name=self.name)
         else: 
             try:
                 scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
@@ -1767,7 +1789,7 @@ class local_update:
             scaling_diag_matrix = scaling_diag_matrix.float()
             scaling_matrix_inv = scaling_matrix_inv.float()
             W_scale = torch.matmul(W, scaling_diag_matrix)
-            self.U, self.S, self.VT = torch.linalg.svd(W_scale, full_matrices=False)  
+            self.U, self.S, self.VT = _safe_svd(W_scale, name=self.name)  
         # trucation SVD
         num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
         self.truc_s = self.S[:num_s_after_trunc].cuda()
@@ -1857,10 +1879,7 @@ if __name__ == '__main__':
             **model_load_kwargs,
         )
         tokenizer = AutoTokenizer.from_pretrained(args.model)
-        if hasattr(model.config, "max_position_embeddings"):
-            model.seqlen = model.config.max_position_embeddings
-        else:
-            model.seqlen = 2048
+        model.seqlen = args.model_seq_len
         model = model.eval()
 
         if args.enable_ccsr and args.profiling_mat_path is not None:
@@ -2004,10 +2023,7 @@ if __name__ == '__main__':
             **model_load_kwargs,
         )
         tokenizer = AutoTokenizer.from_pretrained(args.model)
-        if hasattr(model.config, "max_position_embeddings"):
-            model.seqlen = model.config.max_position_embeddings
-        else:
-            model.seqlen = 2048
+        model.seqlen = args.model_seq_len
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         model = model.eval()
         model = model.float()  # need to set to float

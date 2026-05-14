@@ -390,6 +390,42 @@ def _target_rank(rows, cols, ratio, max_rank):
     return min(rank, max_rank)
 
 
+def _is_llama3_model(model_name_or_path):
+    name = str(model_name_or_path).lower()
+    return "llama-3" in name or "llama3" in name
+
+
+def _effective_rank_ratio_for_module(model_name_or_path, model_config, module_name, ratio):
+    """Relax K/V rank for LLaMA-3.x GQA without touching non-GQA paths."""
+    if not _is_llama3_model(model_name_or_path):
+        return ratio
+    if not (module_name.endswith("k_proj") or module_name.endswith("v_proj")):
+        return ratio
+
+    num_heads = getattr(model_config, "num_attention_heads", None)
+    num_kv_heads = getattr(model_config, "num_key_value_heads", None)
+    if num_heads is None or num_kv_heads is None or num_kv_heads <= 0:
+        return ratio
+
+    group_size = max(1, int(num_heads) // int(num_kv_heads))
+    return min(1.0, ratio * group_size)
+
+
+def _gqa_kv_rank_multiplier(model_name_or_path, model_config):
+    if not _is_llama3_model(model_name_or_path):
+        return 1
+    num_heads = getattr(model_config, "num_attention_heads", None)
+    num_kv_heads = getattr(model_config, "num_key_value_heads", None)
+    if num_heads is None or num_kv_heads is None or num_kv_heads <= 0:
+        return 1
+    return max(1, int(num_heads) // int(num_kv_heads))
+
+
+def _target_rank_for_module(model_name_or_path, model_config, module_name, rows, cols, ratio, max_rank):
+    effective_ratio = _effective_rank_ratio_for_module(model_name_or_path, model_config, module_name, ratio)
+    return _target_rank(rows, cols, effective_ratio, max_rank)
+
+
 def _energy_conserving_recalibrate(full_singular_values, selected_idx, max_scale=None, eps=1e-12):
     selected_s = full_singular_values[selected_idx].float()
     if selected_s.numel() == 0:
@@ -547,17 +583,15 @@ def _iter_batches(calib_loader, max_batches=None):
 
 
 def _select_model_load_dtype(model_name_or_path):
-    name = str(model_name_or_path).lower()
     # Keep existing behavior for LLaMA-1/2 and others.
     # LLaMA-3.x official checkpoints are BF16-first.
-    if ("llama-3" in name or "llama3" in name) and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    if _is_llama3_model(model_name_or_path) and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return torch.float16
 
 
 def _should_force_eager_attn(model_name_or_path):
-    name = str(model_name_or_path).lower()
-    return ("llama-3" in name or "llama3" in name)
+    return _is_llama3_model(model_name_or_path)
 
 
 def _select_model_load_kwargs(model_name_or_path):
@@ -929,6 +963,9 @@ def whitening_sequential(
     model.eval()
     use_cache = model.config.use_cache
     model.config.use_cache = False
+    gqa_multiplier = _gqa_kv_rank_multiplier(model_name, model.config)
+    if gqa_multiplier > 1:
+        print(f"LLaMA-3 GQA rank adaptation: k_proj/v_proj ratio multiplier={gqa_multiplier}, cap=1.0")
 
     if "opt" in model_name:
         layers = model.model.decoder.layers
@@ -1089,7 +1126,15 @@ def whitening_sequential(
             U, singular_values, VT = _safe_svd(W_scale, name=f"{i}:{name}")
             right_proj = torch.matmul(VT, scaling_matrix_inv)
             proj_matrix = singular_values.unsqueeze(1) * right_proj
-            target_rank = _target_rank(W_normal.shape[0], W_normal.shape[1], ratio, singular_values.numel())
+            target_rank = _target_rank_for_module(
+                model_name,
+                model.config,
+                name,
+                W_normal.shape[0],
+                W_normal.shape[1],
+                ratio,
+                singular_values.numel(),
+            )
 
             if outlier_idx.numel() > 0:
                 outlier_weight = W.index_select(1, outlier_idx).cpu()
@@ -1417,6 +1462,9 @@ def whitening(
     sam_max_batches=None,
 ):
     model.eval()
+    gqa_multiplier = _gqa_kv_rank_multiplier(model_name, model.config)
+    if gqa_multiplier > 1:
+        print(f"LLaMA-3 GQA rank adaptation: k_proj/v_proj ratio multiplier={gqa_multiplier}, cap=1.0")
     if "opt" in model_name:
         layers = model.model.decoder.layers
     else:
@@ -1462,7 +1510,15 @@ def whitening(
             U, singular_values, VT = _safe_svd(W_scale, name=f"{i}:{name}")
             right_proj = torch.matmul(VT, scaling_matrix_inv)
             proj_matrix = singular_values.unsqueeze(1) * right_proj
-            target_rank = _target_rank(W_normal.shape[0], W_normal.shape[1], ratio, singular_values.numel())
+            target_rank = _target_rank_for_module(
+                model_name,
+                model.config,
+                name,
+                W_normal.shape[0],
+                W_normal.shape[1],
+                ratio,
+                singular_values.numel(),
+            )
 
             if outlier_idx.numel() > 0:
                 outlier_weight = W.index_select(1, outlier_idx).cpu()

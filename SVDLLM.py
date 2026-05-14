@@ -109,6 +109,7 @@ def _register_rotary_runtime_device_guard(model_name, model):
 
 @torch.no_grad()
 def profle_svdllm(name, model, calib_loader, dev, return_outlier_stats=False):
+    _enforce_model_runtime_compat(name, model)
     if "llama" in name or "mistral" in name or "vicuna" in name:
         layers = model.model.layers
     elif "opt" in name:
@@ -175,6 +176,7 @@ def profle_svdllm(name, model, calib_loader, dev, return_outlier_stats=False):
 
 @torch.no_grad()
 def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outlier_stats=False):
+    _enforce_model_runtime_compat(model_name, model)
     if "opt" in model_name:
         layers = model.model.decoder.layers
         model.model.decoder.embed_tokens = model.model.decoder.embed_tokens.to(dev)
@@ -519,6 +521,24 @@ def _select_model_load_dtype(model_name_or_path):
     return torch.float16
 
 
+def _should_force_eager_attn(model_name_or_path):
+    name = str(model_name_or_path).lower()
+    return ("llama-3" in name or "llama3" in name)
+
+
+def _select_model_load_kwargs(model_name_or_path):
+    kwargs = {}
+    if _should_force_eager_attn(model_name_or_path):
+        kwargs["attn_implementation"] = "eager"
+    return kwargs
+
+
+def _enforce_model_runtime_compat(model_name_or_path, model):
+    if _should_force_eager_attn(model_name_or_path) and hasattr(model, "config"):
+        if hasattr(model.config, "_attn_implementation"):
+            model.config._attn_implementation = "eager"
+
+
 def _hf_update_causal_mask(model, attention_mask, input_tensor, cache_position):
     if not (hasattr(model, "model") and hasattr(model.model, "_update_causal_mask")):
         return attention_mask
@@ -842,6 +862,7 @@ def whitening_sequential(
     if calib_loader is None:
         raise ValueError("CCSR requires calibration data. Please provide calib_loader.")
 
+    _enforce_model_runtime_compat(model_name, model)
     model.eval()
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -1500,6 +1521,7 @@ def whitening(
 @torch.no_grad()
 def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False):
     print("Start SVD decomposition then update...")
+    _enforce_model_runtime_compat(model_name, model)
     use_cache = model.config.use_cache
     model.config.use_cache = False
     if "opt" in model_name:
@@ -1779,7 +1801,14 @@ if __name__ == '__main__':
         
         model_load_dtype = _select_model_load_dtype(args.model)
         print(f"Model load dtype: {model_load_dtype}")
-        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_load_dtype)
+        model_load_kwargs = _select_model_load_kwargs(args.model)
+        if len(model_load_kwargs) > 0:
+            print(f"Model load extra kwargs: {model_load_kwargs}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=model_load_dtype,
+            **model_load_kwargs,
+        )
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         if hasattr(model.config, "max_position_embeddings"):
             model.seqlen = model.config.max_position_embeddings
@@ -1919,7 +1948,14 @@ if __name__ == '__main__':
         # model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model_load_dtype = _select_model_load_dtype(args.model)
         print(f"Model load dtype: {model_load_dtype}")
-        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=model_load_dtype)
+        model_load_kwargs = _select_model_load_kwargs(args.model)
+        if len(model_load_kwargs) > 0:
+            print(f"Model load extra kwargs: {model_load_kwargs}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=model_load_dtype,
+            **model_load_kwargs,
+        )
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         if hasattr(model.config, "max_position_embeddings"):
             model.seqlen = model.config.max_position_embeddings

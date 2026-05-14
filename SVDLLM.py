@@ -116,16 +116,18 @@ def profle_svdllm(name, model, calib_loader, dev, return_outlier_stats=False):
         layers = model.model.decoder.layers
     model = model.to(dev)
     print("Start obtaining the whitening matrix...")
+    cov_dtype = torch.float64 if _use_high_precision_cov(name) else torch.float32
     def hook(module, input, output):
-        inp = input[0].detach().float()
+        inp = input[0].detach()
         if inp.dim() == 2:   # for opt
             inp = inp.unsqueeze(0)
-        adds = torch.matmul(inp.transpose(1,2), inp)
+        inp_cov = inp.to(dtype=cov_dtype)
+        adds = torch.matmul(inp_cov.transpose(1,2), inp_cov)
         adds_sum = torch.sum(adds, dim=0)
         module.raw_scaling_diag_matrix += adds_sum
-        channel_max_abs = inp.abs().amax(dim=(0, 1))
+        channel_max_abs = inp.abs().amax(dim=(0, 1)).float()
         module.channel_max_abs = torch.maximum(module.channel_max_abs, channel_max_abs)
-        del inp, adds, adds_sum
+        del inp, inp_cov, adds, adds_sum
         torch.cuda.empty_cache()
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
@@ -244,21 +246,23 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
         position_ids = cache['position_ids']
     profiling_mat = {}
     outlier_stats = {}
+    cov_dtype = torch.float64 if _use_high_precision_cov(model_name) else torch.float32
     for i in tqdm(range(len(layers))):
         layer_profile = {}
         layer_outlier = {}
         layer = layers[i].to(dev)
         subset = find_layers(layer)        
         def hook(module, input, output):
-            inp = input[0].detach().float()
+            inp = input[0].detach()
             if inp.dim() == 2:  # for opt
                 inp = inp.unsqueeze(0)
-            adds = torch.matmul(inp.transpose(1,2), inp)
+            inp_cov = inp.to(dtype=cov_dtype)
+            adds = torch.matmul(inp_cov.transpose(1,2), inp_cov)
             adds_sum = torch.sum(adds, dim=0)
             module.scaling_diag_matrix += adds_sum
-            channel_max_abs = inp.abs().amax(dim=(0, 1))
+            channel_max_abs = inp.abs().amax(dim=(0, 1)).float()
             module.channel_max_abs = torch.maximum(module.channel_max_abs, channel_max_abs)
-            del inp, adds, adds_sum, output
+            del inp, inp_cov, adds, adds_sum, output
             torch.cuda.empty_cache()
         handles = []
         for name in subset:
@@ -312,7 +316,10 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
 def _safe_cholesky(raw_scaling_diag_matrix, dev):
     # Numerical-stable Cholesky for large covariance matrices.
     # This does not change algorithmic logic; it only hardens decomposition.
-    mat = raw_scaling_diag_matrix.float()
+    if raw_scaling_diag_matrix.dtype in (torch.float64, torch.double):
+        mat = raw_scaling_diag_matrix.to(device=dev, dtype=torch.float64)
+    else:
+        mat = raw_scaling_diag_matrix.to(device=dev, dtype=torch.float32)
     mat = 0.5 * (mat + mat.transpose(0, 1))
 
     n = mat.shape[0]
@@ -344,7 +351,11 @@ def _safe_inverse(scaling_diag_matrix, dev):
         return torch.linalg.inv(scaling_diag_matrix)
     except Exception:
         print("Warning: scaling_diag_matrix is not full rank, adding jitter.")
-        scaling_diag_matrix = scaling_diag_matrix + 1e-6 * torch.eye(scaling_diag_matrix.shape[0], device=dev)
+        scaling_diag_matrix = scaling_diag_matrix + 1e-6 * torch.eye(
+            scaling_diag_matrix.shape[0],
+            device=dev,
+            dtype=scaling_diag_matrix.dtype,
+        )
         return torch.linalg.inv(scaling_diag_matrix)
 
 
@@ -533,6 +544,11 @@ def _select_model_load_kwargs(model_name_or_path):
     return kwargs
 
 
+def _use_high_precision_cov(model_name_or_path):
+    # LLaMA-3.x has stronger activation spikes; use float64 covariance accumulation.
+    return _should_force_eager_attn(model_name_or_path)
+
+
 def _enforce_model_runtime_compat(model_name_or_path, model):
     if _should_force_eager_attn(model_name_or_path) and hasattr(model, "config"):
         if hasattr(model.config, "_attn_implementation"):
@@ -604,18 +620,43 @@ def _build_decoder_layer_kwargs(
 
     cache_position = position_ids[0]
 
-    # Reuse HF internal causal-mask builder for missing/2D masks.
-    need_update_causal_mask = (
-        attention_mask is None
-        or (torch.is_tensor(attention_mask) and attention_mask.dim() <= 2)
-    )
-    if need_update_causal_mask:
-        attention_mask = _hf_update_causal_mask(
-            model=model,
-            attention_mask=attention_mask,
-            input_tensor=x,
-            cache_position=cache_position,
+    if _should_force_eager_attn(model_name):
+        # For LLaMA-3.x eager path, build explicit 4D causal mask to avoid
+        # private API behavior drift across HF versions.
+        min_val = torch.finfo(x.dtype).min
+        base_causal = torch.full(
+            (seq_len, seq_len),
+            fill_value=min_val,
+            dtype=x.dtype,
+            device=dev,
         )
+        base_causal = torch.triu(base_causal, diagonal=1)
+        causal_4d = base_causal[None, None, :, :].expand(x.shape[0], 1, seq_len, seq_len)
+
+        if attention_mask is None:
+            attention_mask = causal_4d
+        elif torch.is_tensor(attention_mask) and attention_mask.dim() == 2:
+            # Fuse 2D padding mask into additive 4D causal mask.
+            pad_mask = attention_mask.to(device=dev, dtype=x.dtype)
+            pad_bias = (1.0 - pad_mask[:, None, None, :]) * min_val
+            attention_mask = causal_4d + pad_bias
+        elif torch.is_tensor(attention_mask) and attention_mask.dim() == 3:
+            attention_mask = attention_mask.to(device=dev, dtype=x.dtype).unsqueeze(1)
+        elif torch.is_tensor(attention_mask) and attention_mask.dim() == 4:
+            attention_mask = attention_mask.to(device=dev, dtype=x.dtype)
+    else:
+        # Reuse HF internal causal-mask builder for missing/2D masks.
+        need_update_causal_mask = (
+            attention_mask is None
+            or (torch.is_tensor(attention_mask) and attention_mask.dim() <= 2)
+        )
+        if need_update_causal_mask:
+            attention_mask = _hf_update_causal_mask(
+                model=model,
+                attention_mask=attention_mask,
+                input_tensor=x,
+                cache_position=cache_position,
+            )
 
     position_embeddings = None
     if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
@@ -948,6 +989,7 @@ def whitening_sequential(
 
     decomposition_book = {}
     ecsvr_scales = []
+    cov_dtype = torch.float64 if _use_high_precision_cov(model_name) else torch.float32
 
     print("Start CCSR: compression-consistent sequential reprofiling...")
     for i in tqdm(range(len(layers))):
@@ -957,15 +999,16 @@ def whitening_sequential(
 
         # Stage 1/2 profiling under compressed-prefix inputs.
         def _profile_hook(module, input, _output):
-            inp = input[0].detach().float()
+            inp = input[0].detach()
             if inp.dim() == 2:
                 inp = inp.unsqueeze(0)
-            adds_sum = torch.sum(torch.matmul(inp.transpose(1, 2), inp), dim=0)
+            inp_cov = inp.to(dtype=cov_dtype)
+            adds_sum = torch.sum(torch.matmul(inp_cov.transpose(1, 2), inp_cov), dim=0)
             if getattr(module, "raw_scaling_diag_matrix", None) is None:
                 module.raw_scaling_diag_matrix = adds_sum
             else:
                 module.raw_scaling_diag_matrix += adds_sum
-            channel_max_abs = inp.abs().amax(dim=(0, 1))
+            channel_max_abs = inp.abs().amax(dim=(0, 1)).float()
             module.channel_max_abs = torch.maximum(module.channel_max_abs, channel_max_abs)
 
         profile_handles = []
@@ -999,7 +1042,7 @@ def whitening_sequential(
         for name in subset:
             module = subset[name]
             W = module.weight.data.float().to(dev)
-            raw_scaling_diag_matrix = module.raw_scaling_diag_matrix.float()
+            raw_scaling_diag_matrix = module.raw_scaling_diag_matrix
             scaling_diag_matrix = _safe_cholesky(raw_scaling_diag_matrix, dev)
 
             normal_idx, outlier_idx = _select_channel_partitions(
@@ -1364,7 +1407,7 @@ def whitening(
         for name in subset:
             module = subset[name]
             W = module.weight.data.float().to(dev)
-            scaling_diag_matrix = profiling_mat[i][name].to(dev).float()
+            scaling_diag_matrix = profiling_mat[i][name].to(dev)
             layer_outlier_ratio = stage1_outlier_ratio
             if stage1_layer_ratio_map is not None and i in stage1_layer_ratio_map:
                 layer_outlier_ratio = float(stage1_layer_ratio_map[i])

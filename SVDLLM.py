@@ -399,7 +399,7 @@ def _effective_rank_ratio_for_module(model_name_or_path, model_config, module_na
     """Relax K/V rank for LLaMA-3.x GQA without touching non-GQA paths."""
     if not _is_llama3_model(model_name_or_path):
         return ratio
-    if not (module_name.endswith("k_proj") or module_name.endswith("v_proj")):
+    if not _is_gqa_kv_module_name(module_name):
         return ratio
 
     num_heads = getattr(model_config, "num_attention_heads", None)
@@ -409,6 +409,23 @@ def _effective_rank_ratio_for_module(model_name_or_path, model_config, module_na
 
     group_size = max(1, int(num_heads) // int(num_kv_heads))
     return min(1.0, ratio * group_size)
+
+
+def _is_gqa_kv_module_name(module_name):
+    return module_name.endswith("k_proj") or module_name.endswith("v_proj")
+
+
+def _should_keep_gqa_kv_uncompressed(model_name_or_path, model_config, module_name):
+    # Diagnostic LLaMA-3.x adaptation: K/V are the shared GQA bottleneck.
+    # Keep them as native nn.Linear to verify whether K/V compression is the
+    # source of the high-PPL collapse before trying block-wise KV SVD.
+    if not _is_llama3_model(model_name_or_path):
+        return False
+    if not _is_gqa_kv_module_name(module_name):
+        return False
+    num_heads = getattr(model_config, "num_attention_heads", None)
+    num_kv_heads = getattr(model_config, "num_key_value_heads", None)
+    return num_heads is not None and num_kv_heads is not None and int(num_heads) > int(num_kv_heads)
 
 
 def _gqa_kv_rank_multiplier(model_name_or_path, model_config):
@@ -781,6 +798,85 @@ def _layer_forward_pass(
 
 
 @torch.no_grad()
+def _check_layer_replay_equivalence(
+    model_name,
+    model,
+    layer,
+    calib_loader,
+    inps,
+    attention_masks,
+    position_ids,
+    dev,
+    max_batches=2,
+):
+    if "opt" in model_name or calib_loader is None:
+        return
+
+    total = min(int(max_batches), inps.shape[0])
+    if total <= 0:
+        return
+
+    class _ReplayCheckStop(Exception):
+        pass
+
+    official_outs = []
+
+    def _capture_layer_output(_module, _input, output):
+        hidden = output[0] if isinstance(output, (tuple, list)) else output
+        official_outs.append(hidden.detach().float().cpu())
+        raise _ReplayCheckStop
+
+    print(f"CCSR replay equivalence check: layer=0, batches={total}")
+    handle = layer.register_forward_hook(_capture_layer_output)
+    guard_handles = _register_rotary_runtime_device_guard(model_name, model)
+    try:
+        for batch in _iter_batches(calib_loader, total):
+            try:
+                batch = {k: v.to(dev) for k, v in batch.items()}
+                model(**batch)
+            except _ReplayCheckStop:
+                pass
+    finally:
+        handle.remove()
+        for h in guard_handles:
+            h.remove()
+
+    total = min(total, len(official_outs))
+    if total <= 0:
+        print("Warning: CCSR replay check captured no official outputs.")
+        return
+
+    replay_outs = torch.zeros_like(inps[:total])
+    _layer_forward_pass(
+        model=model,
+        model_name=model_name,
+        layer=layer,
+        inps=inps[:total],
+        attention_masks=attention_masks[:total] if attention_masks is not None else None,
+        position_ids=position_ids[:total] if position_ids is not None else None,
+        dev=dev,
+        outs=replay_outs,
+        max_batches=None,
+    )
+
+    official = torch.cat(official_outs[:total], dim=0)
+    replay = replay_outs.detach().float().cpu()
+    diff = replay - official
+    official_norm = torch.norm(official)
+    rel_l2 = torch.norm(diff) / torch.clamp(official_norm, min=1e-12)
+    max_abs = diff.abs().max()
+    mean_abs = diff.abs().mean()
+    print(
+        "CCSR replay check layer0: "
+        f"rel_l2={rel_l2.item():.6e}, "
+        f"max_abs={max_abs.item():.6e}, "
+        f"mean_abs={mean_abs.item():.6e}"
+    )
+    if rel_l2.item() > 1e-3 or max_abs.item() > 1e-2:
+        print("Warning: CCSR replay is not numerically equivalent to HF layer forward for LLaMA-3.x.")
+
+
+@torch.no_grad()
 def _apply_sam(
     model_name,
     model,
@@ -1036,6 +1132,20 @@ def whitening_sequential(
     for h in rotary_guard_handles:
         h.remove()
     layers[0] = layers[0].module
+
+    if _is_llama3_model(model_name):
+        _check_layer_replay_equivalence(
+            model_name=model_name,
+            model=model,
+            layer=layers[0],
+            calib_loader=calib_loader,
+            inps=inps,
+            attention_masks=cache["attention_mask"],
+            position_ids=cache["position_ids"] if "opt" not in model_name else None,
+            dev=dev,
+            max_batches=2,
+        )
+
     layers[0] = layers[0].cpu()
 
     if "opt" in model_name:
@@ -1056,6 +1166,7 @@ def whitening_sequential(
     cov_dtype = torch.float64 if _use_high_precision_cov(model_name) else torch.float32
 
     print("Start CCSR: compression-consistent sequential reprofiling...")
+    kept_gqa_kv_modules = 0
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
         subset = find_layers(layer)
@@ -1104,6 +1215,12 @@ def whitening_sequential(
 
         # Stage 1 + Stage 2 decomposition for current layer only.
         for name in subset:
+            if _should_keep_gqa_kv_uncompressed(model_name, model.config, name):
+                subset[name].raw_scaling_diag_matrix = None
+                subset[name].channel_max_abs = None
+                kept_gqa_kv_modules += 1
+                continue
+
             module = subset[name]
             W = module.weight.data.to(dev)
             raw_scaling_diag_matrix = module.raw_scaling_diag_matrix
@@ -1176,6 +1293,8 @@ def whitening_sequential(
         if enable_stage3:
             stage3_runtime = {}
             for name in subset:
+                if name not in layer_book:
+                    continue
                 info = layer_book[name]
                 if info["singular_values"].numel() == 0:
                     info["selected_idx"] = torch.empty(0, dtype=torch.long)
@@ -1247,6 +1366,8 @@ def whitening_sequential(
 
         # Reconstruct current layer immediately.
         for name in subset:
+            if name not in layer_book:
+                continue
             module = subset[name]
             info = layer_book[name]
 
@@ -1326,6 +1447,9 @@ def whitening_sequential(
         layers[i] = layer.cpu()
         inps, outs = outs, inps
         torch.cuda.empty_cache()
+
+    if kept_gqa_kv_modules > 0:
+        print(f"LLaMA-3 GQA K/V protection: kept {kept_gqa_kv_modules} k_proj/v_proj modules uncompressed.")
 
     if enable_ecsvr and len(ecsvr_scales) > 0:
         gamma_tensor = torch.tensor(ecsvr_scales, dtype=torch.float32)
@@ -1484,12 +1608,17 @@ def whitening(
 
     print("Start Stage 1 + Stage 2 decomposition...")
     decomposition_book = {}
+    kept_gqa_kv_modules = 0
 
     for i in tqdm(range(len(layers))):
         layer = layers[i]
         subset = find_layers(layer)
         layer_book = {}
         for name in subset:
+            if _should_keep_gqa_kv_uncompressed(model_name, model.config, name):
+                kept_gqa_kv_modules += 1
+                continue
+
             module = subset[name]
             W = module.weight.data.to(dev)
             scaling_diag_matrix = profiling_mat[i][name].to(dev)
@@ -1580,6 +1709,8 @@ def whitening(
         layer = layers[i]
         subset = find_layers(layer)
         for name in subset:
+            if name not in decomposition_book[i]:
+                continue
             module = subset[name]
             info = decomposition_book[i][name]
 
@@ -1632,6 +1763,9 @@ def whitening(
             U_sel = S_sel = right_proj_sel = sqrt_s = svd_u = svd_v = None
             del U_sel, S_sel, right_proj_sel, sqrt_s, svd_u, svd_v
             torch.cuda.empty_cache()
+
+    if kept_gqa_kv_modules > 0:
+        print(f"LLaMA-3 GQA K/V protection: kept {kept_gqa_kv_modules} k_proj/v_proj modules uncompressed.")
 
     if enable_ecsvr and len(ecsvr_scales) > 0:
         gamma_tensor = torch.tensor(ecsvr_scales, dtype=torch.float32)

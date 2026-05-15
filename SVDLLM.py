@@ -965,7 +965,13 @@ def whitening_sequential(
     model.config.use_cache = False
     gqa_multiplier = _gqa_kv_rank_multiplier(model_name, model.config)
     if gqa_multiplier > 1:
-        print(f"LLaMA-3 GQA rank adaptation: k_proj/v_proj ratio multiplier={gqa_multiplier}, cap=1.0")
+        kv_effective_ratio = min(1.0, ratio * gqa_multiplier)
+        print(
+            "LLaMA-3 GQA rank adaptation: "
+            f"base_ratio={ratio:.6f}, "
+            f"k_proj/v_proj effective_ratio={kv_effective_ratio:.6f}, "
+            f"multiplier={gqa_multiplier}, cap=1.0"
+        )
 
     if "opt" in model_name:
         layers = model.model.decoder.layers
@@ -1464,7 +1470,13 @@ def whitening(
     model.eval()
     gqa_multiplier = _gqa_kv_rank_multiplier(model_name, model.config)
     if gqa_multiplier > 1:
-        print(f"LLaMA-3 GQA rank adaptation: k_proj/v_proj ratio multiplier={gqa_multiplier}, cap=1.0")
+        kv_effective_ratio = min(1.0, ratio * gqa_multiplier)
+        print(
+            "LLaMA-3 GQA rank adaptation: "
+            f"base_ratio={ratio:.6f}, "
+            f"k_proj/v_proj effective_ratio={kv_effective_ratio:.6f}, "
+            f"multiplier={gqa_multiplier}, cap=1.0"
+        )
     if "opt" in model_name:
         layers = model.model.decoder.layers
     else:

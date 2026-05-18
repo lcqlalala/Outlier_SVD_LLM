@@ -157,15 +157,7 @@ def profle_svdllm(name, model, calib_loader, dev, return_outlier_stats=False):
         subset = find_layers(layers[i])
         for name in subset:
             raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix.double().to(dev)
-            try:
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: eigen scaling_diag_matrix is not positive!")
-                eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
-                raw_scaling_diag_matrix += (- eigenvalues[0] + 1e-6) * torch.eye(raw_scaling_diag_matrix.shape[0]).to(dev)
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-                eigenvalues = None
-                del eigenvalues
+            scaling_diag_matrix = _safe_cholesky(raw_scaling_diag_matrix, dev)
             layer_profile[name] = scaling_diag_matrix.cpu()
             scaling_diag_matrix = raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix = None
             del scaling_diag_matrix, raw_scaling_diag_matrix, subset[name].raw_scaling_diag_matrix
@@ -289,18 +281,10 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
         torch.cuda.empty_cache()
         for name in subset:
             raw_scaling_diag_matrix = subset[name].scaling_diag_matrix.double().to(dev)
-            try:
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: eigen scaling_diag_matrix is not positive!")
-                eigenvalues = torch.linalg.eigvalsh(raw_scaling_diag_matrix)
-                raw_scaling_diag_matrix += (- eigenvalues[0] + 1e-6) * torch.eye(raw_scaling_diag_matrix.shape[0]).to(dev)
-                scaling_diag_matrix = torch.linalg.cholesky(raw_scaling_diag_matrix)
-                eigenvalues = None
-                del eigenvalues
+            scaling_diag_matrix = _safe_cholesky(raw_scaling_diag_matrix, dev)
             layer_profile[name] = scaling_diag_matrix.cpu()
-            scaling_diag_matrix = raw_scaling_diag_matrix = subset[name].raw_scaling_diag_matrix = None
-            del scaling_diag_matrix, raw_scaling_diag_matrix, subset[name].raw_scaling_diag_matrix
+            scaling_diag_matrix = raw_scaling_diag_matrix = subset[name].scaling_diag_matrix = None
+            del scaling_diag_matrix, raw_scaling_diag_matrix, subset[name].scaling_diag_matrix
             torch.cuda.empty_cache()
         layers[i] = layer.cpu()
         profiling_mat[i] = layer_profile
@@ -315,7 +299,8 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev, return_outl
  
 def _safe_cholesky(raw_scaling_diag_matrix, dev):
     # Numerical-stable Cholesky for large covariance matrices.
-    # This does not change algorithmic logic; it only hardens decomposition.
+    # We factor a correlation-preconditioned matrix to avoid adding one large
+    # uniform jitter that would wash out low-variance LLaMA-3.x channels.
     if raw_scaling_diag_matrix.dtype in (torch.float64, torch.double):
         mat = raw_scaling_diag_matrix.to(device=dev, dtype=torch.float64)
     else:
@@ -323,40 +308,49 @@ def _safe_cholesky(raw_scaling_diag_matrix, dev):
     mat = 0.5 * (mat + mat.transpose(0, 1))
 
     n = mat.shape[0]
-    eye = torch.eye(n, device=dev, dtype=mat.dtype)
-    diag_mean = torch.clamp(torch.mean(torch.abs(torch.diagonal(mat))), min=1.0)
-    base_jitter = float((diag_mean * 1e-6).item())
+    finfo = torch.finfo(mat.dtype)
+    diag = torch.diagonal(mat)
+    diag_floor = torch.clamp(torch.mean(torch.abs(diag)) * 1e-12, min=finfo.eps)
+    scale = torch.sqrt(torch.clamp(diag, min=diag_floor))
 
+    corr = mat / torch.clamp(scale[:, None] * scale[None, :], min=diag_floor)
+    corr = 0.5 * (corr + corr.transpose(0, 1))
+    corr.diagonal().copy_(torch.ones(n, device=dev, dtype=mat.dtype))
+
+    eye = torch.eye(n, device=dev, dtype=mat.dtype)
+    base_jitter = 1e-8 if mat.dtype == torch.float64 else 1e-5
     jitter = base_jitter
     for _ in range(8):
-        chol, info = torch.linalg.cholesky_ex(mat + jitter * eye)
+        chol_corr, info = torch.linalg.cholesky_ex(corr + jitter * eye)
         if int(info.max().item()) == 0:
-            return chol
+            return scale.unsqueeze(1) * chol_corr
         jitter *= 10.0
 
-    print("Warning: scaling_diag_matrix is not positive definite, fallback to eigenvalue-based jitter.")
-    eigenvalues = torch.linalg.eigvalsh(mat)
-    min_eig = float(eigenvalues.min().item())
-    jitter = max(jitter, -min_eig + base_jitter)
-    chol, info = torch.linalg.cholesky_ex(mat + jitter * eye)
-    if int(info.max().item()) != 0:
-        # Last resort: increase jitter aggressively.
-        jitter = max(jitter * 10.0, 1e-2)
-        chol = torch.linalg.cholesky(mat + jitter * eye)
-    return chol
+    if n <= 4096:
+        print("Warning: correlation matrix is not positive definite, fallback to eigenvalue clipping.")
+        evals, evecs = torch.linalg.eigh(corr)
+        eval_floor = torch.tensor(base_jitter, device=dev, dtype=mat.dtype)
+        evals = torch.clamp(evals, min=eval_floor)
+        corr = (evecs * evals.unsqueeze(0)) @ evecs.transpose(0, 1)
+        corr = 0.5 * (corr + corr.transpose(0, 1))
+        chol_corr = torch.linalg.cholesky(corr + base_jitter * eye)
+        return scale.unsqueeze(1) * chol_corr
+
+    print("Warning: Cholesky failed on a large matrix; using diagonal covariance fallback.")
+    return torch.diag(scale)
 
 
-def _safe_inverse(scaling_diag_matrix, dev):
+def _right_project_from_cholesky(VT, scaling_diag_matrix):
+    """Compute VT @ L^{-1} without explicitly forming inv(L)."""
+    # If L is lower triangular, (VT @ L^{-1})^T solves L^T X = VT^T.
+    lhs = scaling_diag_matrix.transpose(0, 1)
+    rhs = VT.transpose(0, 1)
     try:
-        return torch.linalg.inv(scaling_diag_matrix)
+        solved_t = torch.linalg.solve_triangular(lhs, rhs, upper=True)
     except Exception:
-        print("Warning: scaling_diag_matrix is not full rank, adding jitter.")
-        scaling_diag_matrix = scaling_diag_matrix + 1e-6 * torch.eye(
-            scaling_diag_matrix.shape[0],
-            device=dev,
-            dtype=scaling_diag_matrix.dtype,
-        )
-        return torch.linalg.inv(scaling_diag_matrix)
+        # Fallback is still a solve, not an explicit inverse.
+        solved_t = torch.linalg.solve(lhs, rhs)
+    return solved_t.transpose(0, 1)
 
 
 def _safe_svd(matrix, name=""):
@@ -1244,10 +1238,9 @@ def whitening_sequential(
 
             compute_dtype = scaling_diag_matrix_normal.dtype
             W_normal = W.index_select(1, normal_idx).to(dtype=compute_dtype)
-            scaling_matrix_inv = _safe_inverse(scaling_diag_matrix_normal, dev)
             W_scale = torch.matmul(W_normal, scaling_diag_matrix_normal)
             U, singular_values, VT = _safe_svd(W_scale, name=f"{i}:{name}")
-            right_proj = torch.matmul(VT, scaling_matrix_inv)
+            right_proj = _right_project_from_cholesky(VT, scaling_diag_matrix_normal)
             proj_matrix = singular_values.unsqueeze(1) * right_proj
             target_rank = _target_rank_for_module(
                 model_name,
@@ -1283,9 +1276,9 @@ def whitening_sequential(
             module.raw_scaling_diag_matrix = None
             module.channel_max_abs = None
             W = W_normal = W_scale = raw_scaling_diag_matrix = scaling_diag_matrix = None
-            scaling_diag_matrix_normal = scaling_matrix_inv = None
+            scaling_diag_matrix_normal = None
             U = singular_values = VT = right_proj = proj_matrix = None
-            del W, W_normal, W_scale, raw_scaling_diag_matrix, scaling_diag_matrix, scaling_diag_matrix_normal, scaling_matrix_inv
+            del W, W_normal, W_scale, raw_scaling_diag_matrix, scaling_diag_matrix, scaling_diag_matrix_normal
             del U, singular_values, VT, right_proj, proj_matrix
             torch.cuda.empty_cache()
 
@@ -1646,10 +1639,9 @@ def whitening(
 
             compute_dtype = scaling_diag_matrix_normal.dtype
             W_normal = W.index_select(1, normal_idx).to(dtype=compute_dtype)
-            scaling_matrix_inv = _safe_inverse(scaling_diag_matrix_normal, dev)
             W_scale = torch.matmul(W_normal, scaling_diag_matrix_normal)
             U, singular_values, VT = _safe_svd(W_scale, name=f"{i}:{name}")
-            right_proj = torch.matmul(VT, scaling_matrix_inv)
+            right_proj = _right_project_from_cholesky(VT, scaling_diag_matrix_normal)
             proj_matrix = singular_values.unsqueeze(1) * right_proj
             target_rank = _target_rank_for_module(
                 model_name,
@@ -1681,9 +1673,9 @@ def whitening(
                 "bias": module.bias.data.cpu() if module.bias is not None else None,
             }
 
-            W = W_normal = W_scale = scaling_diag_matrix = scaling_diag_matrix_normal = scaling_matrix_inv = None
+            W = W_normal = W_scale = scaling_diag_matrix = scaling_diag_matrix_normal = None
             U = singular_values = VT = right_proj = proj_matrix = None
-            del W, W_normal, W_scale, scaling_diag_matrix, scaling_diag_matrix_normal, scaling_matrix_inv, U, singular_values, VT, right_proj, proj_matrix
+            del W, W_normal, W_scale, scaling_diag_matrix, scaling_diag_matrix_normal, U, singular_values, VT, right_proj, proj_matrix
             torch.cuda.empty_cache()
         decomposition_book[i] = layer_book
 
@@ -1982,14 +1974,7 @@ class local_update:
         if direct_update:
             self.U, self.S, self.VT = _safe_svd(W.data, name=self.name)
         else: 
-            try:
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
-            except Exception as e:
-                print("Warning: scaling_diag_matrix is not full rank!")
-                scaling_diag_matrix += 1e-6 * torch.eye(scaling_diag_matrix.shape[0])
-                scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
-            scaling_diag_matrix = scaling_diag_matrix.float()
-            scaling_matrix_inv = scaling_matrix_inv.float()
+            scaling_diag_matrix = scaling_diag_matrix.to(device=self.dev, dtype=W.dtype)
             W_scale = torch.matmul(W, scaling_diag_matrix)
             self.U, self.S, self.VT = _safe_svd(W_scale, name=self.name)  
         # trucation SVD
@@ -1999,7 +1984,10 @@ class local_update:
         if direct_update:
             self.truc_v = self.VT[:num_s_after_trunc, :].cuda()
         else:
-            self.truc_v = torch.matmul(self.VT[:num_s_after_trunc, :].cuda(), scaling_matrix_inv)
+            self.truc_v = _right_project_from_cholesky(
+                self.VT[:num_s_after_trunc, :].cuda(),
+                scaling_diag_matrix.cuda(),
+            )
         self.truc_sigma = torch.diag(self.truc_s)
         self.new_w = torch.matmul(self.truc_u, torch.matmul(self.truc_sigma, self.truc_v[:num_s_after_trunc, :]))
         # intialize H for close form solution

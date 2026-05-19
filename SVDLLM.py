@@ -397,11 +397,17 @@ def _is_llama3_model(model_name_or_path):
     return "llama-3" in name or "llama3" in name
 
 
-def _effective_rank_ratio_for_module(model_name_or_path, model_config, module_name, ratio):
+def _effective_rank_ratio_for_module(
+    model_name_or_path,
+    model_config,
+    module_name,
+    ratio,
+    enable_llama3_mlp_rank_realloc=False,
+):
     """Apply LLaMA-3.x structural rank allocation without touching other models."""
     if not _is_llama3_model(model_name_or_path):
         return ratio
-    mlp_multiplier = _llama3_mlp_rank_multiplier(module_name)
+    mlp_multiplier = _llama3_mlp_rank_multiplier(module_name) if enable_llama3_mlp_rank_realloc else 1.0
     if mlp_multiplier != 1.0:
         return min(1.0, ratio * mlp_multiplier)
     if not _is_gqa_kv_module_name(module_name):
@@ -448,10 +454,10 @@ def _should_skip_ecsvr_for_module(model_name_or_path, module_name):
     return _is_llama3_model(model_name_or_path) and _is_attention_proj_module_name(module_name)
 
 
-def _should_skip_stage3_for_module(model_name_or_path, module_name):
+def _should_skip_stage3_for_module(model_name_or_path, module_name, enable_llama3_skip_attention_stage3=False):
     # LLaMA-3.x attention directions can be sparse/bursty but essential.
     # Keep q/o in Stage-2 energy order; Stage3 still applies to MLP.
-    return _is_llama3_model(model_name_or_path) and (
+    return enable_llama3_skip_attention_stage3 and _is_llama3_model(model_name_or_path) and (
         module_name.endswith("q_proj") or module_name.endswith("o_proj")
     )
 
@@ -479,8 +485,23 @@ def _gqa_kv_rank_multiplier(model_name_or_path, model_config):
     return max(1, int(num_heads) // int(num_kv_heads))
 
 
-def _target_rank_for_module(model_name_or_path, model_config, module_name, rows, cols, ratio, max_rank):
-    effective_ratio = _effective_rank_ratio_for_module(model_name_or_path, model_config, module_name, ratio)
+def _target_rank_for_module(
+    model_name_or_path,
+    model_config,
+    module_name,
+    rows,
+    cols,
+    ratio,
+    max_rank,
+    enable_llama3_mlp_rank_realloc=False,
+):
+    effective_ratio = _effective_rank_ratio_for_module(
+        model_name_or_path,
+        model_config,
+        module_name,
+        ratio,
+        enable_llama3_mlp_rank_realloc=enable_llama3_mlp_rank_realloc,
+    )
     return _target_rank(rows, cols, effective_ratio, max_rank)
 
 
@@ -1093,6 +1114,8 @@ def whitening_sequential(
     sam_damp=1e-4,
     sam_max_batches=None,
     fp32_accumulation=False,
+    enable_llama3_mlp_rank_realloc=False,
+    enable_llama3_skip_attention_stage3=False,
 ):
     if calib_loader is None:
         raise ValueError("CCSR requires calibration data. Please provide calib_loader.")
@@ -1110,8 +1133,10 @@ def whitening_sequential(
             f"k_proj/v_proj effective_ratio={kv_effective_ratio:.6f}, "
             f"multiplier={gqa_multiplier}, cap=1.0"
         )
-        print("LLaMA-3 MLP rank reallocation: down_proj=1.25x, gate_proj=1.10x, up_proj=0.65x")
-        print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
+        if enable_llama3_mlp_rank_realloc:
+            print("LLaMA-3 MLP rank reallocation: down_proj=1.25x, gate_proj=1.10x, up_proj=0.65x")
+        if enable_llama3_skip_attention_stage3:
+            print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
 
     if "opt" in model_name:
         layers = model.model.decoder.layers
@@ -1300,6 +1325,7 @@ def whitening_sequential(
                 W_normal.shape[1],
                 ratio,
                 singular_values.numel(),
+                enable_llama3_mlp_rank_realloc=enable_llama3_mlp_rank_realloc,
             )
 
             if outlier_idx.numel() > 0:
@@ -1342,7 +1368,7 @@ def whitening_sequential(
                 if info["singular_values"].numel() == 0:
                     info["selected_idx"] = torch.empty(0, dtype=torch.long)
                     continue
-                if _should_skip_stage3_for_module(model_name, name):
+                if _should_skip_stage3_for_module(model_name, name, enable_llama3_skip_attention_stage3):
                     target_rank = min(info["target_rank"], info["singular_values"].numel())
                     info["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
                     continue
@@ -1524,7 +1550,16 @@ def whitening_sequential(
 
 
 @torch.no_grad()
-def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, stability_lambda, dev, stage3_max_batches=None):
+def _collect_stage3_scores(
+    model_name,
+    model,
+    decomposition_book,
+    calib_loader,
+    stability_lambda,
+    dev,
+    stage3_max_batches=None,
+    enable_llama3_skip_attention_stage3=False,
+):
     if calib_loader is None:
         print("Warning: Stage 3 is enabled, but no calibration loader is provided. Falling back to Stage 2 truncation.")
         return
@@ -1550,7 +1585,7 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
             if info["singular_values"].numel() == 0:
                 info["selected_idx"] = torch.empty(0, dtype=torch.long)
                 continue
-            if _should_skip_stage3_for_module(model_name, name):
+            if _should_skip_stage3_for_module(model_name, name, enable_llama3_skip_attention_stage3):
                 target_rank = min(info["target_rank"], info["singular_values"].numel())
                 info["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
                 continue
@@ -1638,6 +1673,8 @@ def whitening(
     sam_damp=1e-4,
     sam_max_batches=None,
     fp32_accumulation=False,
+    enable_llama3_mlp_rank_realloc=False,
+    enable_llama3_skip_attention_stage3=False,
 ):
     model.eval()
     gqa_multiplier = _gqa_kv_rank_multiplier(model_name, model.config)
@@ -1649,8 +1686,10 @@ def whitening(
             f"k_proj/v_proj effective_ratio={kv_effective_ratio:.6f}, "
             f"multiplier={gqa_multiplier}, cap=1.0"
         )
-        print("LLaMA-3 MLP rank reallocation: down_proj=1.25x, gate_proj=1.10x, up_proj=0.65x")
-        print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
+        if enable_llama3_mlp_rank_realloc:
+            print("LLaMA-3 MLP rank reallocation: down_proj=1.25x, gate_proj=1.10x, up_proj=0.65x")
+        if enable_llama3_skip_attention_stage3:
+            print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
     if "opt" in model_name:
         layers = model.model.decoder.layers
     else:
@@ -1708,6 +1747,7 @@ def whitening(
                 W_normal.shape[1],
                 ratio,
                 singular_values.numel(),
+                enable_llama3_mlp_rank_realloc=enable_llama3_mlp_rank_realloc,
             )
 
             if outlier_idx.numel() > 0:
@@ -1745,6 +1785,7 @@ def whitening(
             stability_lambda=stage3_lambda,
             dev=dev,
             stage3_max_batches=stage3_max_batches,
+            enable_llama3_skip_attention_stage3=enable_llama3_skip_attention_stage3,
         )
     else:
         for i in decomposition_book:
@@ -2111,6 +2152,8 @@ if __name__ == '__main__':
     parser.add_argument('--sam_damp', type=float, default=1e-4, help='SAM: damping coefficient for normal equation regularization')
     parser.add_argument('--sam_max_batches', type=int, default=None, help='SAM: optionally limit calibration batches for least-squares fitting')
     parser.add_argument('--fp32_accumulation', action='store_true', help='Use FP32 internal accumulation in StableSVDLinear, then cast back to model dtype')
+    parser.add_argument('--enable_llama3_mlp_rank_realloc', action='store_true', help='Ablation: enable LLaMA-3 MLP rank reallocation (down/gate up, up down)')
+    parser.add_argument('--enable_llama3_skip_attention_stage3', action='store_true', help='Ablation: keep LLaMA-3 q/o in Stage-2 energy order instead of Stage3')
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -2191,6 +2234,8 @@ if __name__ == '__main__':
                 sam_damp=args.sam_damp,
                 sam_max_batches=args.sam_max_batches,
                 fp32_accumulation=args.fp32_accumulation,
+                enable_llama3_mlp_rank_realloc=args.enable_llama3_mlp_rank_realloc,
+                enable_llama3_skip_attention_stage3=args.enable_llama3_skip_attention_stage3,
             )
         else:
             need_outlier_stats = args.stage1_outlier_ratio > 0 and args.stage1_outlier_criterion == "infinity_norm"
@@ -2258,6 +2303,8 @@ if __name__ == '__main__':
                 sam_damp=args.sam_damp,
                 sam_max_batches=args.sam_max_batches,
                 fp32_accumulation=args.fp32_accumulation,
+                enable_llama3_mlp_rank_realloc=args.enable_llama3_mlp_rank_realloc,
+                enable_llama3_skip_attention_stage3=args.enable_llama3_skip_attention_stage3,
             )
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32

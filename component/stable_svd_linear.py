@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class StableSVDLinear(nn.Module):
@@ -13,11 +14,13 @@ class StableSVDLinear(nn.Module):
         normal_indices,
         outlier_indices,
         bias=False,
+        use_fp32_accumulation=False,
     ):
         super().__init__()
         self.in_features = int(in_features)
         self.out_features = int(out_features)
         self.rank = int(rank)
+        self.use_fp32_accumulation = bool(use_fp32_accumulation)
 
         if normal_indices is None:
             normal_indices = torch.arange(self.in_features, dtype=torch.long)
@@ -53,6 +56,9 @@ class StableSVDLinear(nn.Module):
         return x.index_select(-1, indices)
 
     def forward(self, x):
+        if self.use_fp32_accumulation:
+            return self._forward_fp32_accumulation(x)
+
         out = None
 
         if self.has_low_rank:
@@ -72,3 +78,32 @@ class StableSVDLinear(nn.Module):
             out = out + self.bias.to(dtype=out.dtype, device=out.device)
 
         return out
+
+    def _forward_fp32_accumulation(self, x):
+        orig_dtype = x.dtype
+        x_compute = x.float()
+        out = None
+
+        if self.has_low_rank:
+            x_normal = self._select_channels(x_compute, self.normal_indices)
+            v_weight = self.v_proj.weight.float()
+            u_weight = self.u_proj.weight.float()
+            u_bias = self.u_proj.bias.float() if self.u_proj.bias is not None else None
+            low_rank_out = F.linear(x_normal, v_weight)
+            low_rank_out = F.linear(low_rank_out, u_weight, u_bias)
+            out = low_rank_out
+
+        if self.has_outlier:
+            x_outlier = self._select_channels(x_compute, self.outlier_indices)
+            outlier_weight = self.outlier_proj.weight.float()
+            outlier_out = F.linear(x_outlier, outlier_weight)
+            out = outlier_out if out is None else out + outlier_out
+
+        if out is None:
+            out_shape = (*x.shape[:-1], self.out_features)
+            out = torch.zeros(out_shape, dtype=torch.float32, device=x.device)
+
+        if not self.has_low_rank and getattr(self, "bias", None) is not None:
+            out = out + self.bias.float().to(device=out.device)
+
+        return out.to(orig_dtype)

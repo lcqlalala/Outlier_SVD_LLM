@@ -417,6 +417,22 @@ def _is_gqa_kv_module_name(module_name):
     return module_name.endswith("k_proj") or module_name.endswith("v_proj")
 
 
+def _is_attention_proj_module_name(module_name):
+    return (
+        module_name.endswith("q_proj")
+        or module_name.endswith("k_proj")
+        or module_name.endswith("v_proj")
+        or module_name.endswith("o_proj")
+    )
+
+
+def _should_skip_ecsvr_for_module(model_name_or_path, module_name):
+    # EC-SVR preserves linear-output energy, but attention projections feed a
+    # softmax/geometric head space. On LLaMA-3.x this can over-sharpen or rotate
+    # attention behavior even when the scale looks numerically small.
+    return _is_llama3_model(model_name_or_path) and _is_attention_proj_module_name(module_name)
+
+
 def _should_keep_gqa_kv_uncompressed(model_name_or_path, model_config, module_name):
     # Diagnostic LLaMA-3.x adaptation: K/V are the shared GQA bottleneck.
     # Keep them as native nn.Linear to verify whether K/V compression is the
@@ -1053,6 +1069,7 @@ def whitening_sequential(
     enable_sam=False,
     sam_damp=1e-4,
     sam_max_batches=None,
+    fp32_accumulation=False,
 ):
     if calib_loader is None:
         raise ValueError("CCSR requires calibration data. Please provide calib_loader.")
@@ -1351,7 +1368,9 @@ def whitening_sequential(
                     all_energies = torch.cat(info["energies"], dim=0).to(dev)
                     mean_energy = all_energies.mean(dim=0)
                     var_energy = all_energies.var(dim=0, unbiased=False)
-                    score = mean_energy - stage3_lambda * torch.sqrt(var_energy)
+                    std_energy = torch.sqrt(var_energy)
+                    penalty = torch.minimum(stage3_lambda * std_energy, 0.9 * mean_energy)
+                    score = mean_energy - penalty
                 target_rank = layer_book[name]["target_rank"]
                 target_rank = min(target_rank, score.numel())
                 selected_idx = torch.topk(score, k=target_rank, largest=True).indices
@@ -1373,7 +1392,7 @@ def whitening_sequential(
                 selected_idx = torch.arange(min(1, info["singular_values"].numel()), dtype=torch.long)
 
             U_sel = info["U"][:, selected_idx].float()
-            if enable_ecsvr:
+            if enable_ecsvr and not _should_skip_ecsvr_for_module(model_name, name):
                 S_sel, gamma = _energy_conserving_recalibrate(
                     info["singular_values"],
                     selected_idx,
@@ -1395,6 +1414,7 @@ def whitening_sequential(
                 normal_indices=info["normal_idx"],
                 outlier_indices=info["outlier_idx"],
                 bias=info["has_bias"],
+                use_fp32_accumulation=fp32_accumulation,
             ).to(dtype=module.weight.dtype, device=module.weight.device)
 
             if new_linear.has_low_rank:
@@ -1446,7 +1466,7 @@ def whitening_sequential(
         torch.cuda.empty_cache()
 
     if kept_gqa_kv_modules > 0:
-        print(f"LLaMA-3 GQA K/V protection: kept {kept_gqa_kv_modules} k_proj/v_proj modules uncompressed.")
+        print(f"LLaMA-3 GQA protection: kept {kept_gqa_kv_modules} k_proj/v_proj modules uncompressed.")
 
     if enable_ecsvr and len(ecsvr_scales) > 0:
         gamma_tensor = torch.tensor(ecsvr_scales, dtype=torch.float32)
@@ -1547,7 +1567,9 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
                 all_energies = torch.cat(info["energies"], dim=0).to(dev)
                 mean_energy = all_energies.mean(dim=0)
                 var_energy = all_energies.var(dim=0, unbiased=False)
-                score = mean_energy - stability_lambda * torch.sqrt(var_energy)
+                std_energy = torch.sqrt(var_energy)
+                penalty = torch.minimum(stability_lambda * std_energy, 0.9 * mean_energy)
+                score = mean_energy - penalty
             target_rank = decomposition_book[i][name]["target_rank"]
             target_rank = min(target_rank, score.numel())
             selected_idx = torch.topk(score, k=target_rank, largest=True).indices
@@ -1582,6 +1604,7 @@ def whitening(
     enable_sam=False,
     sam_damp=1e-4,
     sam_max_batches=None,
+    fp32_accumulation=False,
 ):
     model.eval()
     gqa_multiplier = _gqa_kv_rank_multiplier(model_name, model.config)
@@ -1710,7 +1733,7 @@ def whitening(
                 selected_idx = torch.arange(min(1, info["singular_values"].numel()), dtype=torch.long)
 
             U_sel = info["U"][:, selected_idx].float()
-            if enable_ecsvr:
+            if enable_ecsvr and not _should_skip_ecsvr_for_module(model_name, name):
                 S_sel, gamma = _energy_conserving_recalibrate(
                     info["singular_values"],
                     selected_idx,
@@ -1732,6 +1755,7 @@ def whitening(
                 normal_indices=info["normal_idx"],
                 outlier_indices=info["outlier_idx"],
                 bias=info["has_bias"],
+                use_fp32_accumulation=fp32_accumulation,
             ).to(dtype=module.weight.dtype, device=module.weight.device)
 
             if new_linear.has_low_rank:
@@ -1756,7 +1780,7 @@ def whitening(
             torch.cuda.empty_cache()
 
     if kept_gqa_kv_modules > 0:
-        print(f"LLaMA-3 GQA K/V protection: kept {kept_gqa_kv_modules} k_proj/v_proj modules uncompressed.")
+        print(f"LLaMA-3 GQA protection: kept {kept_gqa_kv_modules} k_proj/v_proj modules uncompressed.")
 
     if enable_ecsvr and len(ecsvr_scales) > 0:
         gamma_tensor = torch.tensor(ecsvr_scales, dtype=torch.float32)
@@ -2051,6 +2075,7 @@ if __name__ == '__main__':
     parser.add_argument('--enable_sam', action='store_true', help='Enable SAM: refit up-projection by least squares with fixed subspace projection')
     parser.add_argument('--sam_damp', type=float, default=1e-4, help='SAM: damping coefficient for normal equation regularization')
     parser.add_argument('--sam_max_batches', type=int, default=None, help='SAM: optionally limit calibration batches for least-squares fitting')
+    parser.add_argument('--fp32_accumulation', action='store_true', help='Use FP32 internal accumulation in StableSVDLinear, then cast back to model dtype')
     
     args = parser.parse_args()
     args.ratio = 1- args.ratio
@@ -2130,6 +2155,7 @@ if __name__ == '__main__':
                 enable_sam=args.enable_sam,
                 sam_damp=args.sam_damp,
                 sam_max_batches=args.sam_max_batches,
+                fp32_accumulation=args.fp32_accumulation,
             )
         else:
             need_outlier_stats = args.stage1_outlier_ratio > 0 and args.stage1_outlier_criterion == "infinity_norm"
@@ -2196,6 +2222,7 @@ if __name__ == '__main__':
                 enable_sam=args.enable_sam,
                 sam_damp=args.sam_damp,
                 sam_max_batches=args.sam_max_batches,
+                fp32_accumulation=args.fp32_accumulation,
             )
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32

@@ -326,8 +326,8 @@ def _safe_cholesky(raw_scaling_diag_matrix, dev):
             return scale.unsqueeze(1) * chol_corr
         jitter *= 10.0
 
-    if n <= 4096:
-        print("Warning: correlation matrix is not positive definite, fallback to eigenvalue clipping.")
+    print("Warning: correlation matrix is not positive definite, fallback to eigenvalue clipping.")
+    try:
         evals, evecs = torch.linalg.eigh(corr)
         eval_floor = torch.tensor(base_jitter, device=dev, dtype=mat.dtype)
         evals = torch.clamp(evals, min=eval_floor)
@@ -335,9 +335,17 @@ def _safe_cholesky(raw_scaling_diag_matrix, dev):
         corr = 0.5 * (corr + corr.transpose(0, 1))
         chol_corr = torch.linalg.cholesky(corr + base_jitter * eye)
         return scale.unsqueeze(1) * chol_corr
-
-    print("Warning: Cholesky failed on a large matrix; using diagonal covariance fallback.")
-    return torch.diag(scale)
+    except RuntimeError as exc:
+        print(f"Warning: GPU eigenvalue clipping failed ({exc}); retrying on CPU.")
+        corr_cpu = corr.detach().to(device="cpu", dtype=torch.float64)
+        evals, evecs = torch.linalg.eigh(corr_cpu)
+        eval_floor = torch.tensor(base_jitter, device="cpu", dtype=torch.float64)
+        evals = torch.clamp(evals, min=eval_floor)
+        corr_cpu = (evecs * evals.unsqueeze(0)) @ evecs.transpose(0, 1)
+        corr_cpu = 0.5 * (corr_cpu + corr_cpu.transpose(0, 1))
+        eye_cpu = torch.eye(n, device="cpu", dtype=torch.float64)
+        chol_corr = torch.linalg.cholesky(corr_cpu + base_jitter * eye_cpu)
+        return scale.unsqueeze(1) * chol_corr.to(device=dev, dtype=mat.dtype)
 
 
 def _right_project_from_cholesky(VT, scaling_diag_matrix):
@@ -1295,9 +1303,8 @@ def whitening_sequential(
                 stage3_runtime[name] = {
                     "normal_idx": info["normal_idx"].to(dev),
                     "proj_matrix": info["proj_matrix"].to(dev),
-                    "sum_energy": torch.zeros_like(info["singular_values"], device=dev),
-                    "sum_sq_energy": torch.zeros_like(info["singular_values"], device=dev),
-                    "total_seqs": 0,
+                    "energies": [],
+                    "rank_size": info["singular_values"].numel(),
                 }
 
             def _make_stage3_hook(module_name):
@@ -1313,9 +1320,7 @@ def whitening_sequential(
 
                     response_tensor = torch.matmul(inp, info["proj_matrix"].transpose(0, 1))
                     seq_energy = torch.sum(response_tensor * response_tensor, dim=1)
-                    info["sum_energy"] += seq_energy.sum(dim=0)
-                    info["sum_sq_energy"] += (seq_energy * seq_energy).sum(dim=0)
-                    info["total_seqs"] += seq_energy.shape[0]
+                    info["energies"].append(seq_energy.detach().to(device="cpu", dtype=torch.float64))
 
                 return _hook
 
@@ -1340,13 +1345,12 @@ def whitening_sequential(
 
             for name in stage3_runtime:
                 info = stage3_runtime[name]
-                total_seqs = info["total_seqs"]
-                if total_seqs <= 0:
-                    score = torch.full_like(info["sum_energy"], -1e10)
+                if len(info["energies"]) == 0:
+                    score = torch.full((info["rank_size"],), -1e10, device=dev, dtype=torch.float64)
                 else:
-                    mean_energy = info["sum_energy"] / total_seqs
-                    var_energy = (info["sum_sq_energy"] / total_seqs) - mean_energy * mean_energy
-                    var_energy = torch.clamp(var_energy, min=0.0)
+                    all_energies = torch.cat(info["energies"], dim=0).to(dev)
+                    mean_energy = all_energies.mean(dim=0)
+                    var_energy = all_energies.var(dim=0, unbiased=False)
                     score = mean_energy - stage3_lambda * torch.sqrt(var_energy)
                 target_rank = layer_book[name]["target_rank"]
                 target_rank = min(target_rank, score.numel())
@@ -1354,7 +1358,7 @@ def whitening_sequential(
                 layer_book[name]["selected_idx"] = selected_idx.cpu()
 
                 info["normal_idx"] = info["proj_matrix"] = None
-                info["sum_energy"] = info["sum_sq_energy"] = None
+                info["energies"] = None
                 torch.cuda.empty_cache()
 
         # Reconstruct current layer immediately.
@@ -1500,9 +1504,8 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
             runtime[name] = {
                 "normal_idx": info["normal_idx"].to(dev),
                 "proj_matrix": info["proj_matrix"].to(dev),
-                "sum_energy": torch.zeros_like(info["singular_values"], device=dev),
-                "sum_sq_energy": torch.zeros_like(info["singular_values"], device=dev),
-                "total_seqs": 0,
+                "energies": [],
+                "rank_size": info["singular_values"].numel(),
             }
 
         if len(runtime) == 0:
@@ -1523,10 +1526,7 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
                 response_tensor = torch.matmul(inp, info["proj_matrix"].transpose(0, 1))
                 # seq_energy: [batch, rank]
                 seq_energy = torch.sum(response_tensor * response_tensor, dim=1)
-
-                info["sum_energy"] += seq_energy.sum(dim=0)
-                info["sum_sq_energy"] += (seq_energy * seq_energy).sum(dim=0)
-                info["total_seqs"] += seq_energy.shape[0]
+                info["energies"].append(seq_energy.detach().to(device="cpu", dtype=torch.float64))
             return _hook
 
         for name in runtime:
@@ -1541,13 +1541,12 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
 
         for name in runtime:
             info = runtime[name]
-            total_seqs = info["total_seqs"]
-            if total_seqs <= 0:
-                score = torch.full_like(info["sum_energy"], -1e10)
+            if len(info["energies"]) == 0:
+                score = torch.full((info["rank_size"],), -1e10, device=dev, dtype=torch.float64)
             else:
-                mean_energy = info["sum_energy"] / total_seqs
-                var_energy = (info["sum_sq_energy"] / total_seqs) - mean_energy * mean_energy
-                var_energy = torch.clamp(var_energy, min=0)
+                all_energies = torch.cat(info["energies"], dim=0).to(dev)
+                mean_energy = all_energies.mean(dim=0)
+                var_energy = all_energies.var(dim=0, unbiased=False)
                 score = mean_energy - stability_lambda * torch.sqrt(var_energy)
             target_rank = decomposition_book[i][name]["target_rank"]
             target_rank = min(target_rank, score.numel())
@@ -1555,7 +1554,7 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
             decomposition_book[i][name]["selected_idx"] = selected_idx.cpu()
 
             info["normal_idx"] = info["proj_matrix"] = None
-            info["sum_energy"] = info["sum_sq_energy"] = None
+            info["energies"] = None
             torch.cuda.empty_cache()
 
     model = model.cpu()

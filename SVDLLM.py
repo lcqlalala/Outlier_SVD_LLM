@@ -398,9 +398,12 @@ def _is_llama3_model(model_name_or_path):
 
 
 def _effective_rank_ratio_for_module(model_name_or_path, model_config, module_name, ratio):
-    """Relax K/V rank for LLaMA-3.x GQA without touching non-GQA paths."""
+    """Apply LLaMA-3.x structural rank allocation without touching other models."""
     if not _is_llama3_model(model_name_or_path):
         return ratio
+    mlp_multiplier = _llama3_mlp_rank_multiplier(module_name)
+    if mlp_multiplier != 1.0:
+        return min(1.0, ratio * mlp_multiplier)
     if not _is_gqa_kv_module_name(module_name):
         return ratio
 
@@ -411,6 +414,18 @@ def _effective_rank_ratio_for_module(model_name_or_path, model_config, module_na
 
     group_size = max(1, int(num_heads) // int(num_kv_heads))
     return min(1.0, ratio * group_size)
+
+
+def _llama3_mlp_rank_multiplier(module_name):
+    # Iso-budget among LLaMA-3 MLP projections: down/gate get more rank, up
+    # gives back the budget. The three multipliers sum to 3.0.
+    if module_name.endswith("down_proj"):
+        return 1.25
+    if module_name.endswith("gate_proj"):
+        return 1.10
+    if module_name.endswith("up_proj"):
+        return 0.65
+    return 1.0
 
 
 def _is_gqa_kv_module_name(module_name):
@@ -431,6 +446,14 @@ def _should_skip_ecsvr_for_module(model_name_or_path, module_name):
     # softmax/geometric head space. On LLaMA-3.x this can over-sharpen or rotate
     # attention behavior even when the scale looks numerically small.
     return _is_llama3_model(model_name_or_path) and _is_attention_proj_module_name(module_name)
+
+
+def _should_skip_stage3_for_module(model_name_or_path, module_name):
+    # LLaMA-3.x attention directions can be sparse/bursty but essential.
+    # Keep q/o in Stage-2 energy order; Stage3 still applies to MLP.
+    return _is_llama3_model(model_name_or_path) and (
+        module_name.endswith("q_proj") or module_name.endswith("o_proj")
+    )
 
 
 def _should_keep_gqa_kv_uncompressed(model_name_or_path, model_config, module_name):
@@ -1087,6 +1110,8 @@ def whitening_sequential(
             f"k_proj/v_proj effective_ratio={kv_effective_ratio:.6f}, "
             f"multiplier={gqa_multiplier}, cap=1.0"
         )
+        print("LLaMA-3 MLP rank reallocation: down_proj=1.25x, gate_proj=1.10x, up_proj=0.65x")
+        print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
 
     if "opt" in model_name:
         layers = model.model.decoder.layers
@@ -1317,6 +1342,10 @@ def whitening_sequential(
                 if info["singular_values"].numel() == 0:
                     info["selected_idx"] = torch.empty(0, dtype=torch.long)
                     continue
+                if _should_skip_stage3_for_module(model_name, name):
+                    target_rank = min(info["target_rank"], info["singular_values"].numel())
+                    info["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
+                    continue
                 stage3_runtime[name] = {
                     "normal_idx": info["normal_idx"].to(dev),
                     "proj_matrix": info["proj_matrix"].to(dev),
@@ -1521,6 +1550,10 @@ def _collect_stage3_scores(model_name, model, decomposition_book, calib_loader, 
             if info["singular_values"].numel() == 0:
                 info["selected_idx"] = torch.empty(0, dtype=torch.long)
                 continue
+            if _should_skip_stage3_for_module(model_name, name):
+                target_rank = min(info["target_rank"], info["singular_values"].numel())
+                info["selected_idx"] = torch.arange(target_rank, dtype=torch.long)
+                continue
             runtime[name] = {
                 "normal_idx": info["normal_idx"].to(dev),
                 "proj_matrix": info["proj_matrix"].to(dev),
@@ -1616,6 +1649,8 @@ def whitening(
             f"k_proj/v_proj effective_ratio={kv_effective_ratio:.6f}, "
             f"multiplier={gqa_multiplier}, cap=1.0"
         )
+        print("LLaMA-3 MLP rank reallocation: down_proj=1.25x, gate_proj=1.10x, up_proj=0.65x")
+        print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
     if "opt" in model_name:
         layers = model.model.decoder.layers
     else:

@@ -402,14 +402,10 @@ def _effective_rank_ratio_for_module(
     model_config,
     module_name,
     ratio,
-    enable_llama3_mlp_rank_realloc=False,
 ):
     """Apply LLaMA-3.x structural rank allocation without touching other models."""
     if not _is_llama3_model(model_name_or_path):
         return ratio
-    mlp_multiplier = _llama3_mlp_rank_multiplier(module_name) if enable_llama3_mlp_rank_realloc else 1.0
-    if mlp_multiplier != 1.0:
-        return min(1.0, ratio * mlp_multiplier)
     if not _is_gqa_kv_module_name(module_name):
         return ratio
 
@@ -420,18 +416,6 @@ def _effective_rank_ratio_for_module(
 
     group_size = max(1, int(num_heads) // int(num_kv_heads))
     return min(1.0, ratio * group_size)
-
-
-def _llama3_mlp_rank_multiplier(module_name):
-    # Iso-budget among LLaMA-3 MLP projections: down/gate get more rank, up
-    # gives back the budget. The three multipliers sum to 3.0.
-    if module_name.endswith("down_proj"):
-        return 1.25
-    if module_name.endswith("gate_proj"):
-        return 1.10
-    if module_name.endswith("up_proj"):
-        return 0.65
-    return 1.0
 
 
 def _is_gqa_kv_module_name(module_name):
@@ -448,10 +432,13 @@ def _is_attention_proj_module_name(module_name):
 
 
 def _should_skip_ecsvr_for_module(model_name_or_path, module_name):
+    if not _is_llama3_model(model_name_or_path):
+        return False
     # EC-SVR preserves linear-output energy, but attention projections feed a
-    # softmax/geometric head space. On LLaMA-3.x this can over-sharpen or rotate
-    # attention behavior even when the scale looks numerically small.
-    return _is_llama3_model(model_name_or_path) and _is_attention_proj_module_name(module_name)
+    # softmax/geometric head space. In SwiGLU MLP, gate/up are multiplied, so
+    # scaling them can amplify multiplicative errors. Keep EC-SVR only on
+    # down_proj, the linear MLP output bottleneck.
+    return not module_name.endswith("down_proj")
 
 
 def _should_skip_stage3_for_module(model_name_or_path, module_name, enable_llama3_skip_attention_stage3=False):
@@ -493,14 +480,12 @@ def _target_rank_for_module(
     cols,
     ratio,
     max_rank,
-    enable_llama3_mlp_rank_realloc=False,
 ):
     effective_ratio = _effective_rank_ratio_for_module(
         model_name_or_path,
         model_config,
         module_name,
         ratio,
-        enable_llama3_mlp_rank_realloc=enable_llama3_mlp_rank_realloc,
     )
     return _target_rank(rows, cols, effective_ratio, max_rank)
 
@@ -1114,7 +1099,6 @@ def whitening_sequential(
     sam_damp=1e-4,
     sam_max_batches=None,
     fp32_accumulation=False,
-    enable_llama3_mlp_rank_realloc=False,
     enable_llama3_skip_attention_stage3=False,
 ):
     if calib_loader is None:
@@ -1133,10 +1117,10 @@ def whitening_sequential(
             f"k_proj/v_proj effective_ratio={kv_effective_ratio:.6f}, "
             f"multiplier={gqa_multiplier}, cap=1.0"
         )
-        if enable_llama3_mlp_rank_realloc:
-            print("LLaMA-3 MLP rank reallocation: down_proj=1.25x, gate_proj=1.10x, up_proj=0.65x")
         if enable_llama3_skip_attention_stage3:
             print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
+        if enable_ecsvr:
+            print("LLaMA-3 EC-SVR scope: down_proj only; attention/gate_proj/up_proj skipped")
 
     if "opt" in model_name:
         layers = model.model.decoder.layers
@@ -1325,7 +1309,6 @@ def whitening_sequential(
                 W_normal.shape[1],
                 ratio,
                 singular_values.numel(),
-                enable_llama3_mlp_rank_realloc=enable_llama3_mlp_rank_realloc,
             )
 
             if outlier_idx.numel() > 0:
@@ -1673,7 +1656,6 @@ def whitening(
     sam_damp=1e-4,
     sam_max_batches=None,
     fp32_accumulation=False,
-    enable_llama3_mlp_rank_realloc=False,
     enable_llama3_skip_attention_stage3=False,
 ):
     model.eval()
@@ -1686,10 +1668,10 @@ def whitening(
             f"k_proj/v_proj effective_ratio={kv_effective_ratio:.6f}, "
             f"multiplier={gqa_multiplier}, cap=1.0"
         )
-        if enable_llama3_mlp_rank_realloc:
-            print("LLaMA-3 MLP rank reallocation: down_proj=1.25x, gate_proj=1.10x, up_proj=0.65x")
         if enable_llama3_skip_attention_stage3:
             print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
+        if enable_ecsvr:
+            print("LLaMA-3 EC-SVR scope: down_proj only; attention/gate_proj/up_proj skipped")
     if "opt" in model_name:
         layers = model.model.decoder.layers
     else:
@@ -1747,7 +1729,6 @@ def whitening(
                 W_normal.shape[1],
                 ratio,
                 singular_values.numel(),
-                enable_llama3_mlp_rank_realloc=enable_llama3_mlp_rank_realloc,
             )
 
             if outlier_idx.numel() > 0:
@@ -2152,7 +2133,6 @@ if __name__ == '__main__':
     parser.add_argument('--sam_damp', type=float, default=1e-4, help='SAM: damping coefficient for normal equation regularization')
     parser.add_argument('--sam_max_batches', type=int, default=None, help='SAM: optionally limit calibration batches for least-squares fitting')
     parser.add_argument('--fp32_accumulation', action='store_true', help='Use FP32 internal accumulation in StableSVDLinear, then cast back to model dtype')
-    parser.add_argument('--enable_llama3_mlp_rank_realloc', action='store_true', help='Ablation: enable LLaMA-3 MLP rank reallocation (down/gate up, up down)')
     parser.add_argument('--enable_llama3_skip_attention_stage3', action='store_true', help='Ablation: keep LLaMA-3 q/o in Stage-2 energy order instead of Stage3')
     
     args = parser.parse_args()
@@ -2234,7 +2214,6 @@ if __name__ == '__main__':
                 sam_damp=args.sam_damp,
                 sam_max_batches=args.sam_max_batches,
                 fp32_accumulation=args.fp32_accumulation,
-                enable_llama3_mlp_rank_realloc=args.enable_llama3_mlp_rank_realloc,
                 enable_llama3_skip_attention_stage3=args.enable_llama3_skip_attention_stage3,
             )
         else:
@@ -2303,7 +2282,6 @@ if __name__ == '__main__':
                 sam_damp=args.sam_damp,
                 sam_max_batches=args.sam_max_batches,
                 fp32_accumulation=args.fp32_accumulation,
-                enable_llama3_mlp_rank_realloc=args.enable_llama3_mlp_rank_realloc,
                 enable_llama3_skip_attention_stage3=args.enable_llama3_skip_attention_stage3,
             )
         if args.save_path is not None:

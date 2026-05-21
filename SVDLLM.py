@@ -432,13 +432,10 @@ def _is_attention_proj_module_name(module_name):
 
 
 def _should_skip_ecsvr_for_module(model_name_or_path, module_name):
-    if not _is_llama3_model(model_name_or_path):
-        return False
     # EC-SVR preserves linear-output energy, but attention projections feed a
-    # softmax/geometric head space. In SwiGLU MLP, gate/up are multiplied, so
-    # scaling them can amplify multiplicative errors. Keep EC-SVR only on
-    # down_proj, the linear MLP output bottleneck.
-    return not module_name.endswith("down_proj")
+    # softmax/geometric head space. On LLaMA-3.x this can over-sharpen or rotate
+    # attention behavior even when the scale looks numerically small.
+    return _is_llama3_model(model_name_or_path) and _is_attention_proj_module_name(module_name)
 
 
 def _should_skip_stage3_for_module(model_name_or_path, module_name, enable_llama3_skip_attention_stage3=False):
@@ -1120,7 +1117,7 @@ def whitening_sequential(
         if enable_llama3_skip_attention_stage3:
             print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
         if enable_ecsvr:
-            print("LLaMA-3 EC-SVR scope: down_proj only; attention/gate_proj/up_proj skipped")
+            print("LLaMA-3 EC-SVR scope: MLP only; attention q/k/v/o skipped")
 
     if "opt" in model_name:
         layers = model.model.decoder.layers
@@ -1671,7 +1668,7 @@ def whitening(
         if enable_llama3_skip_attention_stage3:
             print("LLaMA-3 Stage3 adaptation: q_proj/o_proj use Stage-2 energy order")
         if enable_ecsvr:
-            print("LLaMA-3 EC-SVR scope: down_proj only; attention/gate_proj/up_proj skipped")
+            print("LLaMA-3 EC-SVR scope: MLP only; attention q/k/v/o skipped")
     if "opt" in model_name:
         layers = model.model.decoder.layers
     else:
